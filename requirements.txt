@@ -1,19 +1,25 @@
-# Core
 fastapi
 uvicorn
 pydantic
 python-dotenv
 
-# Orchestration
 langgraph
 langchain-core
 
-# Retrieval / ML
-scikit-learn          # TF-IDF stand-in embedder (sandbox-friendly, offline)
-networkx               # graph representation (or swap for neo4j driver)
+networkx
+numpy
+scikit-learn
 
-# --- Swap in for real deployment (outside this sandbox) ---
-# sentence-transformers   # real embeddings (all-MiniLM-L6-v2) + cross-encoder reranker
-# google-generativeai     # Gemini for query rewrite + generation (matches CareerRadar setup)
-# psycopg2-binary         # Postgres client for Supabase deployment
-# pgvector                # pgvector Python bindings
+sentence-transformers
+transformers
+torch
+
+google-genai
+
+GitPython
+
+joblib
+
+rank-bm25
+psycopg2-binary
+pgvector
