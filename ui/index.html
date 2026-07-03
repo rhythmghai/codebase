@@ -1,0 +1,393 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>CodeRAG — ask the codebase</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600&family=Manrope:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --pink-1: #FFE7F1;
+    --pink-2: #FFD3E7;
+    --pink-3: #F7C1DB;
+    --pink-4: #FFF1F7;
+    --rose-accent: #D6588F;
+    --rose-accent-deep: #B8386E;
+    --ink: #4A2039;
+    --ink-soft: #8C6478;
+    --surface: rgba(255, 255, 255, 0.6);
+    --surface-border: rgba(255, 255, 255, 0.85);
+    --badge-vector: #6FA3C7;
+    --badge-bm25: #E39B5C;
+    --badge-graph: #7FAE85;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    min-height: 100vh;
+    font-family: 'Manrope', sans-serif;
+    color: var(--ink);
+    background:
+      radial-gradient(circle at 15% 10%, var(--pink-1), transparent 55%),
+      radial-gradient(circle at 85% 0%, var(--pink-3), transparent 50%),
+      linear-gradient(160deg, var(--pink-4) 0%, var(--pink-2) 50%, var(--pink-1) 100%);
+    background-attachment: fixed;
+    display: flex;
+    justify-content: center;
+    padding: 64px 24px 96px;
+  }
+
+  .page { width: 100%; max-width: 720px; }
+
+  .hero { text-align: center; margin-bottom: 40px; position: relative; }
+
+  .orb {
+    position: absolute;
+    top: -60px; left: 50%;
+    transform: translateX(-50%);
+    width: 220px; height: 220px;
+    border-radius: 50%;
+    background: radial-gradient(circle, rgba(255,255,255,0.9), var(--pink-3) 60%, transparent 75%);
+    filter: blur(18px);
+    z-index: 0;
+    transition: transform 1.4s ease, opacity 1.4s ease;
+    opacity: 0.8;
+  }
+  .orb.thinking {
+    animation: pulse 1.6s ease-in-out infinite;
+  }
+  @keyframes pulse {
+    0%, 100% { transform: translateX(-50%) scale(1); opacity: 0.8; }
+    50% { transform: translateX(-50%) scale(1.15); opacity: 1; }
+  }
+
+  .eyebrow {
+    position: relative; z-index: 1;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 12px;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--rose-accent-deep);
+    margin-bottom: 10px;
+  }
+
+  h1 {
+    position: relative; z-index: 1;
+    font-family: 'Fraunces', serif;
+    font-weight: 500;
+    font-size: 44px;
+    margin: 0 0 10px;
+    letter-spacing: -0.01em;
+  }
+
+  .subtitle {
+    position: relative; z-index: 1;
+    color: var(--ink-soft);
+    font-size: 15px;
+    margin: 0;
+  }
+
+  .ask-card {
+    background: var(--surface);
+    border: 1px solid var(--surface-border);
+    backdrop-filter: blur(14px);
+    border-radius: 20px;
+    padding: 8px;
+    display: flex;
+    gap: 8px;
+    box-shadow: 0 20px 40px -20px rgba(184, 56, 110, 0.25);
+    margin-bottom: 28px;
+  }
+
+  #question {
+    flex: 1;
+    border: none;
+    background: transparent;
+    padding: 14px 16px;
+    font-family: 'Manrope', sans-serif;
+    font-size: 15px;
+    color: var(--ink);
+    outline: none;
+  }
+  #question::placeholder { color: var(--ink-soft); }
+
+  button#askBtn, button#ingestBtn {
+    border: none;
+    background: linear-gradient(135deg, var(--rose-accent), var(--rose-accent-deep));
+    color: white;
+    font-family: 'Manrope', sans-serif;
+    font-weight: 600;
+    font-size: 14px;
+    padding: 0 26px;
+    border-radius: 14px;
+    cursor: pointer;
+    transition: transform 0.15s ease, box-shadow 0.15s ease;
+  }
+  button#askBtn:hover, button#ingestBtn:hover { transform: translateY(-1px); box-shadow: 0 8px 20px -8px var(--rose-accent-deep); }
+  button#askBtn:disabled, button#ingestBtn:disabled { opacity: 0.6; cursor: progress; transform: none; box-shadow: none; }
+
+  .examples {
+    display: flex; flex-wrap: wrap; gap: 8px;
+    margin-bottom: 36px;
+    justify-content: center;
+  }
+  .example-chip {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 12px;
+    padding: 6px 12px;
+    border-radius: 100px;
+    background: rgba(255,255,255,0.5);
+    border: 1px solid var(--surface-border);
+    color: var(--rose-accent-deep);
+    cursor: pointer;
+    transition: background 0.15s ease;
+  }
+  .example-chip:hover { background: rgba(255,255,255,0.85); }
+
+  .result-card {
+    background: var(--surface);
+    border: 1px solid var(--surface-border);
+    backdrop-filter: blur(14px);
+    border-radius: 20px;
+    padding: 28px;
+    box-shadow: 0 20px 40px -20px rgba(184, 56, 110, 0.2);
+    display: none;
+  }
+  .result-card.visible { display: block; animation: rise 0.4s ease; }
+  @keyframes rise { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+
+  .grounded-tag {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    padding: 5px 10px;
+    border-radius: 100px;
+    margin-bottom: 16px;
+  }
+  .grounded-tag.true { background: rgba(127, 174, 133, 0.2); color: #4C7A52; }
+  .grounded-tag.false { background: rgba(227, 155, 92, 0.22); color: #A15F1F; }
+  .grounded-tag .dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+
+  .answer-text {
+    font-size: 15.5px;
+    line-height: 1.7;
+    white-space: pre-wrap;
+    margin: 0 0 24px;
+  }
+  .answer-text code {
+    font-family: 'JetBrains Mono', monospace;
+    background: rgba(214, 88, 143, 0.1);
+    padding: 1px 5px;
+    border-radius: 4px;
+    font-size: 0.9em;
+  }
+
+  .sources-label {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--ink-soft);
+    margin-bottom: 12px;
+  }
+
+  .source-item {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+    padding: 10px 0;
+    border-top: 1px solid rgba(184, 56, 110, 0.1);
+  }
+  .source-item:first-of-type { border-top: none; }
+
+  .source-badge {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 10px;
+    font-weight: 500;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    padding: 3px 8px;
+    border-radius: 6px;
+    color: white;
+    flex-shrink: 0;
+  }
+  .source-badge.vector { background: var(--badge-vector); }
+  .source-badge.bm25 { background: var(--badge-bm25); }
+  .source-badge.graph { background: var(--badge-graph); }
+
+  .source-meta { font-size: 13.5px; }
+  .source-meta .qname { font-family: 'JetBrains Mono', monospace; color: var(--ink); }
+  .source-meta .loc { color: var(--ink-soft); font-size: 12.5px; }
+
+  .status-line {
+    text-align: center;
+    color: var(--ink-soft);
+    font-size: 13px;
+    margin-top: 16px;
+    font-family: 'JetBrains Mono', monospace;
+  }
+  .status-line.error { color: #B8386E; }
+</style>
+</head>
+<body>
+  <div class="page">
+    <div class="hero">
+      <div class="orb" id="orb"></div>
+      <div class="eyebrow">hybrid · graph · reranked</div>
+      <h1>CodeRAG</h1>
+      <p class="subtitle">Ask a natural-language question about the FastAPI source</p>
+    </div>
+
+    <div class="ask-card" id="ingestCard" style="margin-bottom: 14px;">
+      <input id="repoUrl" type="text" placeholder="https://github.com/org/repo" />
+      <button id="ingestBtn" onclick="ingest()">Index repo</button>
+    </div>
+    <div class="status-line" id="ingestStatus" style="margin-bottom: 22px;"></div>
+
+    <div class="ask-card">
+      <input id="question" type="text" placeholder="How does OAuth2 password bearer authentication work?" />
+      <button id="askBtn" onclick="ask()">Ask</button>
+    </div>
+
+    <div class="examples">
+      <span class="example-chip" onclick="fillExample(this)">How do I add an exception handler?</span>
+      <span class="example-chip" onclick="fillExample(this)">How does a route match a request?</span>
+      <span class="example-chip" onclick="fillExample(this)">How do I generate the OpenAPI schema?</span>
+    </div>
+
+    <div class="result-card" id="resultCard">
+      <div class="grounded-tag" id="groundedTag"><span class="dot"></span><span id="groundedLabel"></span></div>
+      <p class="answer-text" id="answerText"></p>
+      <div class="sources-label">Retrieved from</div>
+      <div id="sourcesList"></div>
+    </div>
+
+    <div class="status-line" id="statusLine"></div>
+  </div>
+
+<script>
+  const API_URL = "http://127.0.0.1:8000/query";
+  const INGEST_URL = "http://127.0.0.1:8000/ingest";
+
+  async function ingest() {
+    const repoUrl = document.getElementById('repoUrl').value.trim();
+    const ingestBtn = document.getElementById('ingestBtn');
+    const ingestStatus = document.getElementById('ingestStatus');
+    const orb = document.getElementById('orb');
+
+    if (!repoUrl) return;
+
+    ingestBtn.disabled = true;
+    ingestBtn.textContent = "Indexing…";
+    orb.classList.add('thinking');
+    ingestStatus.classList.remove('error');
+    ingestStatus.textContent = "Cloning and embedding — this can take a minute for larger repos…";
+
+    try {
+      const res = await fetch(INGEST_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ repo_url: repoUrl })
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || `Request failed (${res.status})`);
+
+      ingestStatus.textContent = `Indexed ${data.num_chunks} chunks across ${data.num_files} files from ${data.source_subdir}/`;
+      document.getElementById('question').focus();
+    } catch (e) {
+      ingestStatus.textContent = "⚠ " + e.message;
+      ingestStatus.classList.add('error');
+    } finally {
+      ingestBtn.disabled = false;
+      ingestBtn.textContent = "Index repo";
+      orb.classList.remove('thinking');
+    }
+  }
+
+  function fillExample(el) {
+    document.getElementById('question').value = el.textContent;
+    ask();
+  }
+
+  async function ask() {
+    const question = document.getElementById('question').value.trim();
+    const statusLine = document.getElementById('statusLine');
+    const resultCard = document.getElementById('resultCard');
+    const askBtn = document.getElementById('askBtn');
+    const orb = document.getElementById('orb');
+
+    if (!question) return;
+
+    askBtn.disabled = true;
+    askBtn.textContent = "Thinking…";
+    orb.classList.add('thinking');
+    statusLine.textContent = "";
+    statusLine.classList.remove('error');
+    resultCard.classList.remove('visible');
+
+    try {
+      const res = await fetch(API_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ question })
+      });
+
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.detail || `Request failed (${res.status})`);
+      }
+
+      const data = await res.json();
+      renderResult(data);
+    } catch (e) {
+      statusLine.textContent = "⚠ " + e.message + " — is the API running at " + API_URL + "?";
+      statusLine.classList.add('error');
+    } finally {
+      askBtn.disabled = false;
+      askBtn.textContent = "Ask";
+      orb.classList.remove('thinking');
+    }
+  }
+
+  function renderResult(data) {
+    const resultCard = document.getElementById('resultCard');
+    const groundedTag = document.getElementById('groundedTag');
+    const groundedLabel = document.getElementById('groundedLabel');
+    const answerText = document.getElementById('answerText');
+    const sourcesList = document.getElementById('sourcesList');
+
+    groundedTag.className = 'grounded-tag ' + (data.grounded ? 'true' : 'false');
+    groundedLabel.textContent = data.grounded ? 'Grounded in retrieved context' : (data.warning || 'May not be fully grounded');
+
+    answerText.textContent = data.answer;
+
+    sourcesList.innerHTML = '';
+    (data.sources || []).forEach(s => {
+      const row = document.createElement('div');
+      row.className = 'source-item';
+      row.innerHTML = `
+        <span class="source-badge ${s.source}">${s.source}</span>
+        <span class="source-meta">
+          <div class="qname">${s.qualified_name}</div>
+          <div class="loc">${s.file_path}:${s.start_line}-${s.end_line}</div>
+        </span>`;
+      sourcesList.appendChild(row);
+    });
+
+    resultCard.classList.add('visible');
+  }
+
+  document.getElementById('question').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') ask();
+  });
+</script>
+</body>
+</html>

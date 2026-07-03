@@ -1,0 +1,26 @@
+{
+  "vector-only": {
+    "recall@8": 0.9333333333333333,
+    "precision@8": 0.12083333333333333,
+    "mrr": 0.6505555555555556,
+    "n_queries": 30
+  },
+  "vector + BM25 (hybrid)": {
+    "recall@8": 0.9333333333333333,
+    "precision@8": 0.12083333333333333,
+    "mrr": 0.6825396825396824,
+    "n_queries": 30
+  },
+  "hybrid + rerank": {
+    "recall@8": 0.9666666666666667,
+    "precision@8": 0.125,
+    "mrr": 0.7483333333333333,
+    "n_queries": 30
+  },
+  "hybrid + rerank + graph": {
+    "recall@8": 0.9666666666666667,
+    "precision@8": 0.125,
+    "mrr": 0.7527777777777778,
+    "n_queries": 30
+  }
+}

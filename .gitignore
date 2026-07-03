@@ -1,0 +1,8 @@
+venv/
+repo_src/
+__pycache__/
+*.pyc
+data/store.db
+.env
+.DS_Store
+EOF
