@@ -274,8 +274,9 @@
   </div>
 
 <script>
-  const API_URL = "http://127.0.0.1:8000/query";
-  const INGEST_URL = "http://127.0.0.1:8000/ingest";
+  const API = "https://codebase-production-bf70.up.railway.app";
+  const API_URL = `${API}/query`;
+  const INGEST_URL = `${API}/ingest`;
 
   async function ingest() {
     const repoUrl = document.getElementById('repoUrl').value.trim();
