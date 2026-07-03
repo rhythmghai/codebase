@@ -142,6 +142,18 @@ embeddings, real Gemini generation via `google-genai`), not the sandbox
 stand-ins — the swap is one line each in `ingestion/embedder.py` /
 `retrieval/reranker.py` / `orchestration/llm_client.py`.
 
+## Setup
+
+```bash
+git clone https://github.com/rhythmghai/codebase.git
+cd codebase
+python3 -m venv venv && source venv/bin/activate
+pip install -r requirements.txt
+git clone https://github.com/fastapi/fastapi.git repo_src   # or point /ingest at any repo instead
+python3 ingestion/run_ingestion.py   # regenerates data/embedder.pkl and data/store.db — not tracked in git, since both are deterministically regeneratable from source
+uvicorn api.main:app --reload --port 8000
+```
+
 ## Stack
 
 FastAPI · LangGraph · SQLite (local) / Postgres+pgvector (Supabase, prod
