@@ -27,12 +27,19 @@ class IngestRequest(BaseModel):
     repo_url: str = Field(..., min_length=8, max_length=300)
 
 
-class IngestResponse(BaseModel):
-    status: str
+class IngestStartedResponse(BaseModel):
+    job_id: str
+    status: str  # "started"
+
+
+class IngestStatusResponse(BaseModel):
+    job_id: str
+    status: str  # "running" | "done" | "error"
     repo_url: str
-    num_chunks: int
-    num_files: int
-    source_subdir: str
+    num_chunks: int | None = None
+    num_files: int | None = None
+    source_subdir: str | None = None
+    error: str | None = None
 
 
 class RetrievedChunkResponse(BaseModel):
@@ -99,6 +106,9 @@ state = {
 }
 state_lock = threading.Lock()
 
+jobs: dict[str, dict] = {}   # job_id -> status dict, in-memory (fine for a single-instance demo)
+jobs_lock = threading.Lock()
+
 
 def _load_default_pipeline():
     try:
@@ -119,37 +129,62 @@ def health():
     return {"status": "ok", "active_repo": state["active_repo"], "ready": state["pipeline"] is not None}
 
 
-@app.post("/ingest", response_model=IngestResponse)
-def ingest(req: IngestRequest):
+def _run_ingest_job(job_id: str, repo_url: str):
+    """
+    Runs in a background thread. Cloning + embedding can take anywhere from
+    seconds to minutes depending on repo size and available CPU/RAM -- doing
+    this inside the request/response cycle is fragile on constrained infra
+    (a slow container can hit a reverse-proxy timeout or get OOM-killed
+    mid-request, orphaning the caller with no response ever coming back).
+    Returning a job_id immediately and polling status instead means a slow
+    or failed ingest degrades to "still running" / a clear error, not a
+    silently hung request.
+    """
+    try:
+        result = ingest_from_url(repo_url)
+        new_pipeline = CodebaseRAGPipeline(
+            db_path=result["db_path"],
+            graph_path=result["graph_path"],
+            embedder_path=result["embedder_path"],
+        )
+        with state_lock:
+            state["pipeline"] = new_pipeline
+            state["active_repo"] = repo_url
+        with jobs_lock:
+            jobs[job_id].update(
+                status="done",
+                num_chunks=result["num_chunks"],
+                num_files=result["num_files"],
+                source_subdir=result["source_subdir"],
+            )
+    except Exception as e:
+        with jobs_lock:
+            jobs[job_id].update(status="error", error=str(e))
+
+
+@app.post("/ingest", response_model=IngestStartedResponse)
+def ingest(req: IngestRequest, background_tasks: BackgroundTasks):
     if not ingest_limiter.allow():
         raise HTTPException(status_code=429, detail="Ingestion rate limit exceeded, try again shortly")
     if not req.repo_url.startswith(("https://github.com/", "https://gitlab.com/")):
         raise HTTPException(status_code=400, detail="Only public GitHub/GitLab HTTPS URLs are supported")
 
-    try:
-        result = ingest_from_url(req.repo_url)
-    except RuntimeError as e:
-        raise HTTPException(status_code=422, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Ingestion failed: {e}")
+    import uuid
+    job_id = str(uuid.uuid4())
+    with jobs_lock:
+        jobs[job_id] = {"status": "running", "repo_url": req.repo_url}
 
-    new_pipeline = CodebaseRAGPipeline(
-        db_path=result["db_path"],
-        graph_path=result["graph_path"],
-        embedder_path=result["embedder_path"],
-    )
+    background_tasks.add_task(_run_ingest_job, job_id, req.repo_url)
+    return IngestStartedResponse(job_id=job_id, status="started")
 
-    with state_lock:
-        state["pipeline"] = new_pipeline
-        state["active_repo"] = req.repo_url
 
-    return IngestResponse(
-        status="indexed",
-        repo_url=req.repo_url,
-        num_chunks=result["num_chunks"],
-        num_files=result["num_files"],
-        source_subdir=result["source_subdir"],
-    )
+@app.get("/ingest/status/{job_id}", response_model=IngestStatusResponse)
+def ingest_status(job_id: str):
+    with jobs_lock:
+        job = jobs.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Unknown job_id")
+    return IngestStatusResponse(job_id=job_id, **job)
 
 
 @app.post("/query", response_model=QueryResponse)
