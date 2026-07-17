@@ -2,145 +2,156 @@
 
 Point it at a GitHub repo URL, wait for it to index, then ask natural-language
 questions about that codebase and get grounded answers with file/line
-citations. Combines vector search, BM25, and lightweight graph traversal,
-reranked, and orchestrated through a **fixed-edge pipeline** rather than an
-autonomous agent loop.
+citations. Combines vector search, BM25, and graph traversal (Neo4j/Cypher),
+reranked, orchestrated through a **fixed-edge LangGraph pipeline** rather
+than an autonomous agent loop.
 
 Built to demonstrate production-RAG engineering discipline, not just "call
-an LLM with retrieved context":
+an LLM with retrieved context" — most of what's below is the record of
+actually testing that claim and fixing what testing found broken.
 
-- **Hybrid retrieval, not just vector search** — dense (semantic) + BM25
-  (lexical, catches exact identifiers a vector model can miss) + graph
-  neighbor expansion (structural context: calls, imports, class membership)
-- **Query rewriting before it hits the index** — a single scoped LLM call
-  splits the raw question into a semantic variant, a lexical variant, and
-  sub-queries for multi-hop questions
-- **Reranking as a distinct stage** — broad, cheap retrieval first; a finer
-  (more expensive) relevance signal applied only to the top candidates
-- **Deterministic where it should be deterministic** — ingestion, AST
-  chunking, graph construction, and candidate merging are all plain code.
-  Only two things ever touch an LLM: query rewrite and final generation.
-  No open-ended agent loop deciding what to do next.
-- **Evals before touching weights or prompts** — a hand-labeled 30-query
-  eval set measures Recall@8 / Precision@8 / MRR, with an ablation table
-  showing the actual effect of each architectural piece (see below).
-- **Works on any Python repo, not just one hardcoded corpus** — `/ingest`
-  clones a repo, auto-detects its actual source directory (skips
-  tests/docs/vendored noise, handles both flat and `src/`-layout packages),
-  and indexes it live. Verified against two structurally different real
-  repos (FastAPI, `requests`).
+## What's actually in here
+
+- **Hybrid retrieval** — dense vector search (sentence-transformers) + BM25
+  full-text + graph neighbor expansion (calls / class-containment,
+  extracted deterministically from the AST, not LLM-inferred)
+- **Real graph database, not a JSON adjacency list** — Neo4j AuraDB, queried
+  via Cypher at retrieval time. Ingestion resolves callee references once
+  and pushes nodes/edges in; falls back gracefully to a local JSON graph if
+  Neo4j isn't configured or unreachable
+- **Query rewriting** before it hits the index — a single scoped LLM call,
+  never an open-ended agent loop
+- **Live ingestion** — `/ingest` clones a repo, auto-detects its source
+  layout (handles both flat and `src/`-layout packages), and indexes it as
+  an async background job (returns a job_id immediately, polled via
+  `/ingest/status/{job_id}`) rather than blocking the request — verified
+  against two structurally different real repos (FastAPI, `requests`)
+- **Two hand-labeled eval sets** (30 single-hop + 12 multi-hop/structural
+  queries) with ablation testing across every architectural stage — not
+  just "it works," but "here's the measured effect of each piece, and here's
+  what happened when the measurement itself was wrong"
 
 ## Architecture
 
 ```
-  ingestion (triggered by POST /ingest, deterministic once triggered)
-    git clone -> auto-detect source dir -> AST chunker -> {chunks.jsonl, graph.json}
+  ingestion (POST /ingest, async job + polling)
+    git clone -> auto-detect source dir -> AST chunker -> {chunks, call/contains graph}
+                                              |                        |
+                                        embed (sentence-transformers)  push to Neo4j (Cypher)
                                               |
-                                        embed (sentence-transformers, pluggable)
-                                              |
-                                        store (SQLite locally / Postgres+pgvector in prod)
+                                        store (SQLite / Postgres+pgvector in prod)
 
   query time (POST /query, LangGraph, fixed edges)
-    rewrite -> hybrid_retrieve (vector + BM25 + graph) -> rerank
+    rewrite -> hybrid_retrieve (vector + BM25 + Neo4j graph traversal) -> rerank
              -> assemble_context -> generate -> self_check -> answer
 ```
 
-A minimal pastel-themed web UI (`ui/index.html`) sits on top of both
-endpoints — paste a repo URL, index it, then ask questions, no build step.
+A pastel-themed web UI (`ui/index.html`) sits on top: paste a repo URL,
+index it, ask questions — no build step, polls ingestion status live.
 
-**Known simplification, stated rather than hidden:** ingestion is
-synchronous (the `/ingest` request blocks until cloning+embedding finish)
-and a single global pipeline instance backs the whole API, so indexing a
-new repo replaces the previously active one. Fine for a demo; a production
-version would run ingestion as a background job with status polling, and
-key storage by `repo_id` so multiple repos/users can be served concurrently
-without one user's ingest call evicting another's active repo.
+## Eval results
 
-## Eval results (30 hand-labeled queries, k=8, indexed repo: FastAPI)
+Embeddings: sentence-transformers (all-MiniLM-L6-v2). Two reranker options
+implemented and **directly benchmarked against each other**, not just one
+assumed to be better:
 
-Embeddings: real sentence-transformers (all-MiniLM-L6-v2, 384-dim).
-Reranker: lexical field-weighted overlap (see `retrieval/reranker.py` —
-a real cross-encoder is implemented and swappable via
-`get_reranker("cross-encoder")`, not substituted into this specific run).
+| Set (n)                | Config                | Recall@8 | MRR   |
+|-------------------------|------------------------|---------:|------:|
+| Single-hop (30)          | vector-only            | 0.933    | 0.651 |
+| Single-hop (30)          | hybrid                 | 0.933    | 0.688 |
+| Single-hop (30)          | hybrid + rerank (neural) | 0.967  | 0.735 |
+| Single-hop (30)          | hybrid + rerank (lexical)| 0.967  | 0.748 |
+| Multi-hop (12)           | vector-only            | 1.000    | 0.535 |
+| Multi-hop (12)           | hybrid + rerank (neural) | 0.667  | 0.272 |
+| Multi-hop (12)           | hybrid + rerank (lexical)| 0.667  | 0.369 |
 
-| Config                     | Recall@8 | Precision@8 | MRR   |
-|-----------------------------|---------:|-------------:|------:|
-| vector-only                 | 0.933    | 0.121         | 0.651 |
-| vector + BM25 (hybrid)       | 0.933    | 0.121         | 0.683 |
-| hybrid + rerank              | 0.967    | 0.125         | 0.748 |
-| hybrid + rerank + graph      | 0.967    | 0.125         | 0.753 |
+**Finding: a lexical, field-weighted reranker consistently beats a general-purpose
+neural cross-encoder (`ms-marco-MiniLM-L-6-v2`) on code search, and the gap
+widens on harder multi-hop queries.** The cross-encoder is trained on
+natural-language web-passage ranking; it has no exposure to code syntax or
+identifiers, and it measurably prioritizes prose similarity over the exact
+identifier/signature overlap that actually indicates relevance in code. This
+is the reranker the system defaults to — chosen from a benchmark, not an
+assumption. The neural cross-encoder remains implemented and swappable
+(`get_reranker("cross-encoder")`) for anyone who wants to test a
+code-fine-tuned alternative.
 
-### The debugging story behind these numbers
+**Known limitation, stated rather than hidden:** the multi-hop set is only
+12 queries — small enough that a single query flipping status moves Recall@8
+by ~8 points. The reranker-choice finding replicated independently across
+both eval sets and is treated as solid; graph's specific numeric contribution
+within the multi-hop set is not treated as stable at this sample size and
+would need a larger set (25-30+) before drawing firm conclusions there.
 
-This system went through five real bugs during development, each caught by
-either the eval harness or by testing against a second, different repo —
-which is itself the point of building evals and testing on more than one
-corpus rather than trusting a single happy-path run.
+## The bug-fix history behind these numbers
 
-**1. Hybrid initially underperformed vector-only** (MRR 0.651 → 0.481 in
-an earlier run). `merge_candidates` compared raw vector cosine scores
-against raw BM25 rank scores directly — two incomparable scales — so
-whichever channel produced larger numbers dominated the merge regardless
-of actual relevance. Fixed with Reciprocal Rank Fusion (RRF): merge by
-each candidate's *rank* within its own list instead of its raw score.
+Five distinct bugs, each found through eval regression or cross-repo/cross-eval-set
+testing rather than code inspection alone — this is the actual argument for
+why the eval harness and multi-corpus testing exist, not a footnote.
 
-**2. The fix didn't show up in eval numbers on the first rerun.** The eval
-harness had its own duplicated retrieval-merge logic that flattened vector
-and BM25 results into one pre-ranked list before calling the merge
-function, destroying the per-channel rank information RRF depends on.
-Removed the duplication so eval and the live API share one retrieval path.
+1. **Hybrid initially underperformed vector-only.** Raw vector-cosine and
+   BM25-rank scores were compared directly in the merge step — incomparable
+   scales, so whichever channel produced larger numbers dominated regardless
+   of relevance. Fixed with Reciprocal Rank Fusion (rank-based merging).
+2. **The fix didn't show up on the first re-measurement.** The eval harness
+   had its own duplicated retrieval-merge logic that destroyed the
+   per-channel rank information RRF needs. Removed the duplication.
+3. **Graph expansion looked neutral-to-negative even after the RRF fix.**
+   Traced to an unbounded candidate pool reaching the reranker. Capped it
+   to the top 20 by retrieval score before reranking.
+4. **`chunk_id` collisions on a second, different repo.** FastAPI never
+   triggered it; `requests` did immediately (`UNIQUE constraint failed`).
+   Root cause: chunk IDs were hashed from qualified names alone, and
+   `@property` getter/setter pairs, `@x.setter`, and conditional `__init__`
+   redefinitions all share a qualified name across genuinely different
+   function bodies. Fixed with a composite key
+   (`file_path + qualified_name + content_hash + start_line`) — collision-proof
+   by construction, verified against a synthetic `@overload` case that
+   previously would have broken it.
+5. **Verifying the Neo4j migration surfaced a real, pre-existing bug in the
+   local JSON fallback path.** `graph_expand_local` resolved neighbor
+   candidates against a qname-to-id mapping scoped only to the seed chunks
+   themselves — meaning it could structurally never surface a genuinely new
+   neighbor. It had been a silent no-op the entire time (confirmed
+   empirically: 0 neighbors returned on realistic production seeds before
+   the fix, up to 19 after). Fixed by resolving against the full corpus
+   instead of the seed-scoped subset. This also means an earlier "+0.005 MRR
+   graph contribution" claim measured through this broken path was retracted
+   once the bug was found, not kept as a result.
 
-**3. Graph expansion still looked neutral-to-negative after the RRF fix.**
-Traced to an unbounded candidate pool reaching the reranker — with no cap,
-occasional graph neighbors could out-score genuine hits on lexical overlap
-alone, since the lexical reranker doesn't use the retrieval-stage score at
-all. Capped the pool to the top 20 candidates by retrieval score before
-reranking. Graph then flipped to a small, real, positive contribution
-(+0.005 MRR) — modest because this 30-query set is mostly single-hop
-docstring lookups, where hybrid+rerank alone already finds the answer;
-it should matter more for structural/multi-hop questions ("what breaks if
-I change X's signature") that this labeled set under-represents.
-
-**4. Deprecated SDK.** `google-generativeai` reached end-of-support;
-migrated `GeminiLLM` and `GeminiEmbedder` to the new `google-genai` client
-(`genai.Client(...)` / `client.models.generate_content(...)`), removing a
-`FutureWarning` on every startup.
-
-**5. `chunk_id` collisions on a second, different repo.** Ingesting
-FastAPI never surfaced this, but running the same pipeline against
-`requests` (a different repo, different code patterns) immediately threw
-`UNIQUE constraint failed: chunks.chunk_id`. Root cause: `chunk_id` is a
-hash of a chunk's qualified name, and the AST chunker had no handling for
-legitimate same-name redefinitions — `@property` getter/setter pairs,
-`@x.setter`/`@x.deleter`, and conditional `__init__` redefinitions all
-produce two different function bodies under the identical qualified name.
-Fixed by disambiguating repeated names with their source line number
-(`Module.Class.method@L94`) the second time a name is seen within a file.
-Verified: 320/320 chunks now produce 320 unique IDs on `requests`, where 20
-real same-name redefinitions were correctly caught and disambiguated.
+Building the second (multi-hop) eval set itself also surfaced a sixth,
+smaller lesson: 3 of its first 4 "failing" queries turned out to be
+ground-truth labeling errors, not retrieval failures — the system's actual
+top result was correct, the label was wrong. Verifying eval ground truth is
+its own discipline, not a one-time setup step.
 
 ## API
 
-- `POST /ingest` — `{"repo_url": "https://github.com/org/repo"}`. Clones,
-  auto-detects the source directory, chunks, embeds, and stores. Returns
-  chunk/file counts. Rate-limited separately and more strictly than
-  `/query` (cloning+embedding is expensive).
-- `POST /query` — `{"question": "..."}`. Runs the full LangGraph pipeline
-  against whichever repo was last ingested. Returns the answer, a
-  groundedness flag, and the retrieved sources with file/line citations
-  and which retrieval channel (vector/bm25/graph) surfaced each one.
+- `POST /ingest` — `{"repo_url": "..."}`. Returns `{job_id, status}`
+  immediately; actual clone+embed+graph-load runs as a background task.
+- `GET /ingest/status/{job_id}` — poll for `running` / `done` / `error`.
+- `POST /query` — `{"question": "..."}`. Returns the answer, a groundedness
+  flag, and retrieved sources with file/line citations and which channel
+  (vector/bm25/graph) surfaced each one.
 - `GET /health` — status + currently active repo.
 
-## Sandbox note
+## Known simplifications (stated, not hidden)
 
-Large portions of this were first built and debugged in a network-restricted
-sandbox without access to huggingface.co, where the embedder/reranker
-defaulted to offline stand-ins (TF-IDF+SVD, weighted lexical overlap) behind
-the same interface as the real neural models. All numbers and screenshots
-in this README are from the real local environment (real sentence-transformer
-embeddings, real Gemini generation via `google-genai`), not the sandbox
-stand-ins — the swap is one line each in `ingestion/embedder.py` /
-`retrieval/reranker.py` / `orchestration/llm_client.py`.
+- One global pipeline instance backs the API — indexing a new repo replaces
+  the previously active one. A production version would key storage by
+  `repo_id` to serve multiple repos/users concurrently.
+- Neo4j's AuraDB free tier is a single shared instance — every node/edge is
+  scoped by `repo_id` to prevent cross-repo contamination, but there's no
+  per-tenant isolation beyond that property filter.
+- Ingestion is full delete-then-reinsert, not incremental upsert — correct
+  but wasteful for a repo that's barely changed since last index.
+
+## Stack
+
+FastAPI · LangGraph · Neo4j AuraDB (Cypher graph traversal) · SQLite (local)
+/ Postgres+pgvector (Supabase, prod target) · sentence-transformers (MiniLM
+embeddings) · Gemini 2.5 flash-lite via `google-genai` (query rewrite +
+generation) · vanilla HTML/CSS/JS (UI, no build step)
 
 ## Setup
 
@@ -150,13 +161,10 @@ cd codebase
 python3 -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
 git clone https://github.com/fastapi/fastapi.git repo_src   # or point /ingest at any repo instead
-python3 ingestion/run_ingestion.py   # regenerates data/embedder.pkl and data/store.db — not tracked in git, since both are deterministically regeneratable from source
+python3 ingestion/run_ingestion.py   # regenerates data/embedder.pkl and data/store.db -- not tracked in git, deterministically regeneratable from source
 uvicorn api.main:app --reload --port 8000
 ```
 
-## Stack
-
-FastAPI · LangGraph · SQLite (local) / Postgres+pgvector (Supabase, prod
-target) · sentence-transformers (MiniLM embeddings) · networkx (call/import
-graph) · Gemini 2.5 flash-lite via `google-genai` (query rewrite +
-generation) · vanilla HTML/CSS/JS (UI, no build step)
+Neo4j (optional but recommended): set `NEO4J_URI`, `NEO4J_USERNAME`,
+`NEO4J_PASSWORD` in `.env` (free AuraDB instance). Without it, graph
+expansion falls back to the local JSON file automatically.
