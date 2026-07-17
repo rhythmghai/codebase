@@ -1,9 +1,10 @@
+cat > .gitignore << 'EOF'
 venv/
 repo_src/
 __pycache__/
 *.pyc
 data/store.db
+data/embedder.pkl
 .env
 .DS_Store
-EOFdata/embedder.pkl
-data/store.db
+EOF
