@@ -8,6 +8,7 @@ to whatever I manually cloned once" -- the /ingest API endpoint calls this.
 """
 
 import re
+import json
 import shutil
 import subprocess
 import pickle
@@ -107,6 +108,25 @@ def ingest_from_url(repo_url: str, workspace_root: str = "/tmp/codebase-rag-work
     with open(embedder_path, "wb") as f:
         pickle.dump(embedder, f)
 
+    # Push the graph into Neo4j too, in addition to the JSON file (which
+    # stays as the offline fallback -- see retrieval/hybrid_search.py's
+    # graph_expand() dispatcher). Failure here is non-fatal: ingestion as a
+    # whole should still succeed and fall back to local JSON traversal if
+    # Neo4j isn't configured or unreachable, rather than blocking the whole
+    # pipeline on an optional enhancement.
+    neo4j_loaded = False
+    try:
+        from storage.neo4j_client import get_neo4j_store
+        neo4j_store = get_neo4j_store()
+        if neo4j_store is not None:
+            with open(data_dir / "graph.json") as f:
+                graph_json = json.load(f)
+            neo4j_store.load_graph(slug, [c.__dict__ for c in chunks], graph_json)
+            neo4j_store.close()
+            neo4j_loaded = True
+    except Exception as e:
+        print(f"Neo4j load skipped/failed ({e}); local JSON graph traversal will be used instead.")
+
     return {
         "repo_url": repo_url,
         "slug": slug,
@@ -116,4 +136,5 @@ def ingest_from_url(repo_url: str, workspace_root: str = "/tmp/codebase-rag-work
         "db_path": str(db_path),
         "graph_path": str(data_dir / "graph.json"),
         "embedder_path": str(embedder_path),
+        "neo4j_loaded": neo4j_loaded,
     }

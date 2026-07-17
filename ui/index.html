@@ -274,9 +274,8 @@
   </div>
 
 <script>
-  const API = "https://codebase-production-bf70.up.railway.app";
-  const API_URL = `${API}/query`;
-  const INGEST_URL = `${API}/ingest`;
+  const API_URL = "http://127.0.0.1:8000/query";
+  const INGEST_URL = "http://127.0.0.1:8000/ingest";
 
   async function ingest() {
     const repoUrl = document.getElementById('repoUrl').value.trim();
@@ -290,18 +289,42 @@
     ingestBtn.textContent = "Indexing…";
     orb.classList.add('thinking');
     ingestStatus.classList.remove('error');
-    ingestStatus.textContent = "Cloning and embedding — this can take a minute for larger repos…";
+    ingestStatus.textContent = "Starting…";
 
     try {
-      const res = await fetch(INGEST_URL, {
+      // Step 1: kick off the job -- returns immediately with a job_id,
+      // the actual clone+embed work happens in a background task.
+      const startRes = await fetch(INGEST_URL, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ repo_url: repoUrl })
       });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.detail || `Request failed (${res.status})`);
+      const startData = await startRes.json();
+      if (!startRes.ok) throw new Error(startData.detail || `Request failed (${startRes.status})`);
 
-      ingestStatus.textContent = `Indexed ${data.num_chunks} chunks across ${data.num_files} files from ${data.source_subdir}/`;
+      const jobId = startData.job_id;
+      ingestStatus.textContent = "Cloning and embedding — this can take a minute for larger repos…";
+
+      // Step 2: poll status every 2s until done or error.
+      const statusUrl = INGEST_URL + "/status/" + jobId;
+      let result = null;
+      while (true) {
+        await new Promise(r => setTimeout(r, 2000));
+        const statusRes = await fetch(statusUrl);
+        const statusData = await statusRes.json();
+        if (!statusRes.ok) throw new Error(statusData.detail || "Status check failed");
+
+        if (statusData.status === "done") {
+          result = statusData;
+          break;
+        }
+        if (statusData.status === "error") {
+          throw new Error(statusData.error || "Ingestion failed");
+        }
+        // still "running" -- keep polling
+      }
+
+      ingestStatus.textContent = `Indexed ${result.num_chunks} chunks across ${result.num_files} files from ${result.source_subdir}/`;
       document.getElementById('question').focus();
     } catch (e) {
       ingestStatus.textContent = "⚠ " + e.message;

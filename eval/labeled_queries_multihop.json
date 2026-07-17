@@ -1,0 +1,50 @@
+[
+  {
+    "query": "When FastAPI.setup() runs at app startup, what docs/OpenAPI endpoints does it wire up?",
+    "relevant": ["fastapi.applications.FastAPI.setup", "fastapi.openapi.docs.get_swagger_ui_html", "fastapi.openapi.docs.get_redoc_html", "fastapi.openapi.docs.get_swagger_ui_oauth2_redirect_html"]
+  },
+  {
+    "query": "How does FastAPI avoid blocking the event loop when resolving a generator-based dependency?",
+    "relevant": ["fastapi.dependencies.utils._solve_generator", "fastapi.concurrency.contextmanager_in_threadpool"]
+  },
+  {
+    "query": "How does FastAPI detect whether a dependency callable is an async generator, accounting for wrapped or partial functions?",
+    "relevant": ["fastapi.dependencies.models.Dependant.is_async_gen_callable"]
+  },
+  {
+    "query": "What helper does form-body extraction rely on to check if a field is a valid bytes annotation?",
+    "relevant": ["fastapi.dependencies.utils._extract_form_body", "fastapi._compat.shared.is_bytes_or_nonable_bytes_annotation"]
+  },
+  {
+    "query": "What utility is used across the codebase to safely check subclass relationships without crashing on non-class types?",
+    "relevant": ["fastapi._compat.shared.lenient_issubclass"]
+  },
+  {
+    "query": "When you call include_router, what class is actually constructing the merged route table under the hood?",
+    "relevant": ["fastapi.applications.FastAPI.include_router", "fastapi.routing.APIRouter"]
+  },
+  {
+    "query": "If APIRoute.matches changes its return type, what other route classes implement the same method and might break?",
+    "relevant": ["fastapi.routing.APIRoute.matches", "fastapi.routing.APIRouter.matches", "fastapi.routing.APIWebSocketRoute.matches"]
+  },
+  {
+    "query": "What class is APIRoute.matches actually a method of, structurally?",
+    "relevant": ["fastapi.routing.APIRoute", "fastapi.routing.APIRoute.matches"]
+  },
+  {
+    "query": "Where does FastAPI.openapi() get the routes' version info from when generating the schema?",
+    "relevant": ["fastapi.applications.FastAPI.openapi", "fastapi.routing.APIRouter._get_routes_version"]
+  },
+  {
+    "query": "What determines whether request body fields should be embedded as a single field vs a model, and what does that check depend on?",
+    "relevant": ["fastapi.dependencies.utils._should_embed_body_fields", "fastapi._compat.shared.lenient_issubclass"]
+  },
+  {
+    "query": "What other HTTP method decorators on FastAPI (besides get and post) share the same underlying default-value mechanism?",
+    "relevant": ["fastapi.datastructures.Default", "fastapi.applications.FastAPI.put", "fastapi.applications.FastAPI.delete"]
+  },
+  {
+    "query": "What field-extraction helper checks whether a parameter should be treated as a sequence field?",
+    "relevant": ["fastapi.dependencies.utils._get_flat_fields_from_params", "fastapi._compat.shared.field_annotation_is_sequence"]
+  }
+]

@@ -41,8 +41,29 @@ class GraphData:
     contains: list = field(default_factory=list) # (class_qname, method_qname)
 
 
-def _make_id(qualified_name: str) -> str:
-    return hashlib.sha1(qualified_name.encode()).hexdigest()[:12]
+def _make_chunk_id(file_path: str, qualified_name: str, source: str, start_line: int) -> str:
+    """
+    Composite key: file_path + qualified_name + content_hash + start_line.
+
+    Why this shape, not just hash(qualified_name):
+    - qualified_name alone collides on legitimate same-name redefinitions
+      (@property getter/setter pairs, conditional __init__ redefinitions) --
+      this is the bug that originally broke ingestion on a second repo.
+    - Adding a content hash means identical code under different names still
+      gets distinct ids (correct), and near-identical overload stubs with
+      the same name+file don't silently dedupe into one row when they sit
+      at different physical locations.
+    - start_line is the final tie-breaker: two structurally identical
+      @overload stubs (same qualified_name, same file, same body) would
+      otherwise still collide on file+qname+content_hash alone -- and the
+      storage schema + UI both assume exactly one physical location per
+      chunk_id (one start_line/end_line, one citation rendered per source).
+      start_line is always unique within a file regardless of content,
+      so it closes that gap without becoming the primary disambiguator.
+    """
+    content_hash = hashlib.sha1(source.encode("utf-8")).hexdigest()[:12]
+    key = f"{file_path}::{qualified_name}::{content_hash}::{start_line}"
+    return hashlib.sha1(key.encode("utf-8")).hexdigest()[:12]
 
 
 def _get_signature(node) -> str:
@@ -89,7 +110,7 @@ def chunk_file(file_path: Path, repo_root: Path) -> tuple[list[Chunk], GraphData
     mod_doc = ast.get_docstring(tree)
     if mod_doc:
         chunks.append(Chunk(
-            chunk_id=_make_id(module_qname + ".__module__"),
+            chunk_id=_make_chunk_id(rel_path, module_qname + ".__module__", mod_doc, 1),
             kind="module_docstring",
             name=Path(rel_path).name,
             qualified_name=module_qname,
@@ -112,16 +133,16 @@ def chunk_file(file_path: Path, repo_root: Path) -> tuple[list[Chunk], GraphData
 
     def handle_function(node, parent_class: str = ""):
         base_qname = f"{module_qname}.{parent_class + '.' if parent_class else ''}{node.name}"
-        # Same-name redefinitions are legal Python and common in the wild:
-        # @property getter/setter pairs, @x.setter/@x.deleter, @overload
-        # variants. Each is a distinct chunk with distinct source, but they'd
-        # otherwise collide on qualified_name -> same chunk_id -> UNIQUE
-        # constraint failure at storage time. Disambiguate with the line
-        # number, which is always unique within a file.
+        # qname disambiguation here is for GRAPH correctness, not chunk_id
+        # uniqueness (that's handled independently by _make_chunk_id's content
+        # hash below). Without this, a @property getter/setter pair would
+        # both write to graph.nodes[qname] under the same key, and the
+        # second write would silently overwrite the first -- losing one of
+        # the two methods as a distinct node in the call/contains graph.
         qname = base_qname if base_qname not in _seen_qnames else f"{base_qname}@L{node.lineno}"
         _seen_qnames.add(qname)
-        cid = _make_id(qname)
         src = "\n".join(lines[node.lineno - 1:node.end_lineno])
+        cid = _make_chunk_id(rel_path, qname, src, node.lineno)
         doc = ast.get_docstring(node) or ""
         kind = "method" if parent_class else "function"
 
@@ -159,7 +180,7 @@ def chunk_file(file_path: Path, repo_root: Path) -> tuple[list[Chunk], GraphData
             bases = [b.id for b in node.bases if isinstance(b, ast.Name)]
 
             chunks.append(Chunk(
-                chunk_id=_make_id(class_qname),
+                chunk_id=_make_chunk_id(rel_path, class_qname, src, node.lineno),
                 kind="class",
                 name=node.name,
                 qualified_name=class_qname,

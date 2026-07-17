@@ -31,6 +31,7 @@ DB_PATH = str(_PROJECT_ROOT / "data" / "store.db")
 GRAPH_PATH = str(_PROJECT_ROOT / "data" / "graph.json")
 EMBEDDER_PATH = str(_PROJECT_ROOT / "data" / "embedder.pkl")
 LABELED_PATH = str(_PROJECT_ROOT / "eval" / "labeled_queries.json")
+LABELED_MULTIHOP_PATH = str(_PROJECT_ROOT / "eval" / "labeled_queries_multihop.json")
 
 
 def recall_at_k(ranked_ids: list[str], relevant: set[str], k: int) -> float:
@@ -60,19 +61,21 @@ def qnames_to_ids(qnames: list[str], all_chunks: list[dict]) -> set[str]:
 
 def run_config(query: str, query_vec, use_bm25: bool, use_graph: bool, use_rerank: bool,
                 reranker, k: int = 8) -> list[str]:
-    result_lists = [vector_search(query_vec, DB_PATH, top_k=15)]
+    candidates = []
+    if True:  # vector always on -- baseline retrieval channel
+        candidates += vector_search(query_vec, DB_PATH, top_k=15)
     if use_bm25:
-        result_lists.append(bm25_search_wrapper(query, DB_PATH, top_k=15))
+        candidates += bm25_search_wrapper(query, DB_PATH, top_k=15)
 
-    merged = merge_candidates(*result_lists)
+    merged = merge_candidates(candidates)
 
     if use_graph:
         seed_ids = list(merged.keys())[:8]
         chunk_lookup = get_chunks_by_ids(DB_PATH, seed_ids)
-        graph_results = graph_expand(seed_ids, GRAPH_PATH, chunk_lookup)
+        graph_results = graph_expand(seed_ids, GRAPH_PATH, chunk_lookup, DB_PATH)
         merged = merge_candidates(list(merged.values()), graph_results)
 
-    ordered = sorted(merged.values(), key=lambda r: -r.score)[:20]
+    ordered = sorted(merged.values(), key=lambda r: -r.score)
 
     if use_rerank:
         ranked = reranker.rerank(query, ordered, DB_PATH, top_k=k)
@@ -105,12 +108,8 @@ def evaluate_config(labeled: list[dict], all_chunks: list[dict], embedder, reran
     }
 
 
-def main():
-    labeled = json.load(open(LABELED_PATH))
-    all_chunks = [json.loads(l) for l in open(_PROJECT_ROOT / "data" / "chunks.jsonl")]
-    embedder = pickle.load(open(EMBEDDER_PATH, "rb"))
-    reranker = get_reranker("lexical")
-
+def run_eval_set(name: str, labeled_path: str, all_chunks: list, embedder, reranker) -> dict:
+    labeled = json.load(open(labeled_path))
     configs = [
         ("vector-only",                 dict(use_bm25=False, use_graph=False, use_rerank=False)),
         ("vector + BM25 (hybrid)",       dict(use_bm25=True,  use_graph=False, use_rerank=False)),
@@ -118,16 +117,39 @@ def main():
         ("hybrid + rerank + graph",      dict(use_bm25=True,  use_graph=True,  use_rerank=True)),
     ]
 
-    print(f"{'Config':<28} {'Recall@8':>10} {'Precision@8':>13} {'MRR':>8}  (n={len(labeled)})")
+    print(f"\n=== {name} (n={len(labeled)}) ===")
+    print(f"{'Config':<28} {'Recall@8':>10} {'Precision@8':>13} {'MRR':>8}")
     print("-" * 65)
     results = {}
-    for name, kwargs in configs:
+    for config_name, kwargs in configs:
         metrics = evaluate_config(labeled, all_chunks, embedder, reranker, **kwargs)
-        results[name] = metrics
-        print(f"{name:<28} {metrics['recall@8']:>10.3f} {metrics['precision@8']:>13.3f} {metrics['mrr']:>8.3f}")
+        results[config_name] = metrics
+        print(f"{config_name:<28} {metrics['recall@8']:>10.3f} {metrics['precision@8']:>13.3f} {metrics['mrr']:>8.3f}")
+    return results
+
+
+def main():
+    all_chunks = [json.loads(l) for l in open(_PROJECT_ROOT / "data" / "chunks.jsonl")]
+    embedder = pickle.load(open(EMBEDDER_PATH, "rb"))
+    try:
+        reranker = get_reranker("cross-encoder")
+        reranker_name = "cross-encoder (neural)"
+    except Exception as e:
+        print(f"Cross-encoder unavailable ({e}); falling back to lexical reranker.")
+        reranker = get_reranker("lexical")
+        reranker_name = "lexical (fallback)"
+    print(f"Using reranker: {reranker_name}")
+
+    all_results = {}
+    all_results["single_hop"] = run_eval_set(
+        "Single-hop (original set)", LABELED_PATH, all_chunks, embedder, reranker
+    )
+    all_results["multi_hop"] = run_eval_set(
+        "Multi-hop / structural (graph-focused set)", LABELED_MULTIHOP_PATH, all_chunks, embedder, reranker
+    )
 
     with open(_PROJECT_ROOT / "eval" / "results.json", "w") as f:
-        json.dump(results, f, indent=2)
+        json.dump(all_results, f, indent=2)
     print("\nSaved to eval/results.json")
 
 

@@ -47,12 +47,29 @@ class PipelineState(TypedDict, total=False):
 
 class CodebaseRAGPipeline:
     def __init__(self, db_path: str, graph_path: str, embedder_path: str,
-                 reranker_backend: str = "cross-encoder", llm_backend: str | None = None):
+                 reranker_backend: str = "lexical", llm_backend: str | None = None,
+                 repo_id: str | None = None, use_neo4j: bool = True):
         self.db_path = db_path
         self.graph_path = graph_path
         self.embedder = pickle.load(open(embedder_path, "rb"))
         self.reranker = get_reranker(reranker_backend)
         self.llm = get_llm(llm_backend)
+        self.repo_id = repo_id
+
+        # Neo4j is optional per-instance, not a hard dependency: if it's not
+        # configured or the connection fails, retrieval silently falls back
+        # to the local JSON graph (see hybrid_search.graph_expand's
+        # dispatcher) rather than crashing the whole pipeline. A query
+        # pipeline shouldn't go down because an enhancement layer is
+        # unavailable.
+        self.neo4j_store = None
+        if use_neo4j and repo_id is not None:
+            try:
+                from storage.neo4j_client import get_neo4j_store
+                self.neo4j_store = get_neo4j_store()
+            except Exception:
+                self.neo4j_store = None
+
         self.graph = self._build_graph()
 
     # ---- nodes ----
@@ -70,6 +87,7 @@ class CodebaseRAGPipeline:
         candidates = hybrid_retrieve(
             lexical_query, query_vec, self.db_path, self.graph_path,
             top_k_each=15, use_graph=True,
+            neo4j_store=self.neo4j_store, repo_id=self.repo_id,
         )
         return {**state, "candidates": candidates}
 
@@ -130,11 +148,10 @@ class CodebaseRAGPipeline:
 
 
 if __name__ == "__main__":
-    project_root = Path(__file__).parent.parent
     pipeline = CodebaseRAGPipeline(
-        db_path=str(project_root / "data" / "store.db"),
-        graph_path=str(project_root / "data" / "graph.json"),
-        embedder_path=str(project_root / "data" / "embedder.pkl"),
+        db_path="/home/claude/codebase-rag/data/store.db",
+        graph_path="/home/claude/codebase-rag/data/graph.json",
+        embedder_path="/home/claude/codebase-rag/data/embedder.pkl",
     )
     result = pipeline.run("How does FastAPI match an incoming request to a route?")
     print("REWRITE:", result["rewrite"])

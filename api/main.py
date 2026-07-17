@@ -116,6 +116,7 @@ def _load_default_pipeline():
             db_path=str(DATA_DIR / "store.db"),
             graph_path=str(DATA_DIR / "graph.json"),
             embedder_path=str(DATA_DIR / "embedder.pkl"),
+            repo_id="fastapi_test",
         )
     except FileNotFoundError:
         return None  # no default data ingested yet -- /ingest is required first
@@ -146,6 +147,7 @@ def _run_ingest_job(job_id: str, repo_url: str):
             db_path=result["db_path"],
             graph_path=result["graph_path"],
             embedder_path=result["embedder_path"],
+            repo_id=result["slug"],
         )
         with state_lock:
             state["pipeline"] = new_pipeline

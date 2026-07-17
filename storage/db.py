@@ -113,6 +113,33 @@ def get_chunks_by_ids(db_path: str, chunk_ids: list[str]) -> dict[str, dict]:
     return {r["chunk_id"]: dict(r) for r in rows}
 
 
+def get_all_qname_to_id(db_path: str) -> dict[str, str]:
+    """Full-corpus qualified_name -> chunk_id mapping (not scoped to any
+    particular seed set). Needed by graph_expand_local: resolving a
+    genuinely new neighbor to a real chunk_id requires knowing about chunks
+    beyond whatever small seed batch triggered the expansion."""
+    conn = get_conn(db_path)
+    rows = conn.execute("SELECT qualified_name, chunk_id FROM chunks").fetchall()
+    conn.close()
+    return {r["qualified_name"]: r["chunk_id"] for r in rows}
+
+
+def get_ids_by_qnames(db_path: str, qualified_names: list[str]) -> dict[str, str]:
+    """Reverse lookup: qualified_name -> chunk_id. Needed because Neo4j
+    stores/returns qualified_names, but retrieval elsewhere works in terms
+    of chunk_id (the SQLite/Postgres primary key)."""
+    if not qualified_names:
+        return {}
+    conn = get_conn(db_path)
+    placeholders = ",".join("?" * len(qualified_names))
+    rows = conn.execute(
+        f"SELECT qualified_name, chunk_id FROM chunks WHERE qualified_name IN ({placeholders})",
+        qualified_names,
+    ).fetchall()
+    conn.close()
+    return {r["qualified_name"]: r["chunk_id"] for r in rows}
+
+
 def bm25_search(db_path: str, query: str, top_k: int = 20) -> list[tuple[str, float]]:
     """Returns [(chunk_id, bm25_rank_score), ...] — lower fts5 rank = more relevant."""
     conn = get_conn(db_path)
