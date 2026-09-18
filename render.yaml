@@ -1,0 +1,60 @@
+# Render Blueprint for the CodeRAG API. Deploys api/main.py via the
+# repo's own Dockerfile (git is required at runtime for /ingest, and the
+# Dockerfile already installs it correctly -- reusing it avoids
+# duplicating that logic in a native buildCommand).
+#
+# Free tier, no persistent disk: SQLite (chunk metadata, job status), the
+# embedded Qdrant vector index, and any live-ingested repo's workspace all
+# live on the container's ephemeral filesystem -- they're wiped on every
+# restart/redeploy, and Render's free tier spins the service down after
+# ~15 minutes of inactivity, which counts as a restart on the next
+# request. Practical effect: no repo is pre-loaded on a cold start (the
+# service comes up with ready:false, exactly as it does locally before
+# the first /ingest) -- POST /ingest again after any period of inactivity.
+# This is a deliberate cost tradeoff, not a bug: persistent disks require
+# the paid "starter" tier or above. See storage/vector_store.py and
+# storage/db.py's module docstrings for what's stored where.
+#
+# IMPORTANT: `branch` below targets the feature branch this Blueprint was
+# authored on (PR #1), not `main` -- main does not have this hardened
+# code yet. Update this to `main` (or remove the field, main is Render's
+# default) once that PR is merged.
+
+services:
+  - type: web
+    name: coderag-api
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    plan: free
+    region: oregon
+    branch: hardening-and-vector-db
+    healthCheckPath: /health
+    envVars:
+      - key: DATA_DIR
+        value: /app/data
+      - key: WORKSPACE_ROOT
+        value: /app/data/workspaces
+      - key: LOG_LEVEL
+        value: INFO
+      # Required before any public traffic reaches this service -- without
+      # it, auth is disabled and this becomes an open proxy for compute
+      # and LLM spend (see common/config.py). Fill in via the Dashboard.
+      - key: API_KEYS
+        sync: false
+      # Set to the deployed UI's origin (e.g. https://ui-coral-tau.vercel.app)
+      # once that's known -- unset means CORS stays wide open ("*").
+      - key: ALLOWED_ORIGINS
+        sync: false
+      # Optional: enables real Gemini generation instead of the
+      # deterministic RuleBasedLLM fallback.
+      - key: GOOGLE_API_KEY
+        sync: false
+      # Optional: enables Neo4j graph traversal instead of the local JSON
+      # fallback. Leave unset to skip Neo4j entirely.
+      - key: NEO4J_URI
+        sync: false
+      - key: NEO4J_USERNAME
+        sync: false
+      - key: NEO4J_PASSWORD
+        sync: false

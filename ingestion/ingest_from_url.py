@@ -12,11 +12,14 @@ import json
 import shutil
 import subprocess
 import pickle
+import logging
 from pathlib import Path
 
 from ingestion.chunker import ingest_repo
 from ingestion.embedder import get_embedder
 from storage.db import build_store
+
+logger = logging.getLogger(__name__)
 
 
 _IGNORE_DIR_NAMES = {
@@ -31,6 +34,12 @@ def _slugify(repo_url: str) -> str:
     org = repo_url.rstrip("/").split("/")[-2] if "/" in repo_url.rstrip("/") else ""
     slug = f"{org}_{name}" if org else name
     return re.sub(r"[^a-zA-Z0-9_-]", "-", slug).lower()
+
+
+# Public alias -- api/main.py needs this to dedupe concurrent /ingest calls
+# for the same repo (by slug) before kicking off a background job, not just
+# internally within this module.
+slugify_repo_url = _slugify
 
 
 def clone_repo(repo_url: str, workspace_root: Path) -> Path:
@@ -85,8 +94,11 @@ def ingest_from_url(repo_url: str, workspace_root: str = "/tmp/codebase-rag-work
     slug = _slugify(repo_url)
     repo_dir = workspace_root_path / slug
 
+    logger.info("Ingest starting: repo_url=%s slug=%s", repo_url, slug)
+
     cloned_path = clone_repo(repo_url, workspace_root_path)
     source_subdir = detect_source_dir(cloned_path)
+    logger.info("Cloned %s, detected source subdir '%s'", repo_url, source_subdir)
 
     data_dir = repo_dir / "data"
     chunks, graph = ingest_repo(str(cloned_path), str(data_dir), subdir=source_subdir)
@@ -96,13 +108,23 @@ def ingest_from_url(repo_url: str, workspace_root: str = "/tmp/codebase-rag-work
             f"No Python source found under detected subdir '{source_subdir}'. "
             f"This repo may not be a Python project, or its source layout wasn't detected correctly."
         )
+    logger.info("Chunked %s: %d chunks", repo_url, len(chunks))
 
     embedder = get_embedder("sentence-transformer")
     texts = [f"{c.qualified_name}\n{c.signature}\n{c.docstring}\n{c.source}" for c in chunks]
     vectors = embedder.encode(texts)
 
     db_path = data_dir / "store.db"
-    build_store(str(db_path), [c.__dict__ for c in chunks], vectors)
+    build_store(str(db_path), [c.__dict__ for c in chunks])
+    logger.info("Stored chunk metadata for %s to %s", repo_url, db_path)
+
+    # Vector storage is a required capability, not a best-effort enhancement
+    # like the Neo4j push below -- a repo with no vector index can't be
+    # meaningfully queried, so a failure here is allowed to raise and fail
+    # the whole ingest job rather than degrading silently.
+    from storage.vector_store import QdrantVectorStore
+    QdrantVectorStore().rebuild(slug, [c.chunk_id for c in chunks], vectors)
+    logger.info("Indexed %d vectors for %s into Qdrant collection '%s'", len(chunks), repo_url, slug)
 
     embedder_path = data_dir / "embedder.pkl"
     with open(embedder_path, "wb") as f:
@@ -124,9 +146,10 @@ def ingest_from_url(repo_url: str, workspace_root: str = "/tmp/codebase-rag-work
             neo4j_store.load_graph(slug, [c.__dict__ for c in chunks], graph_json)
             neo4j_store.close()
             neo4j_loaded = True
-    except Exception as e:
-        print(f"Neo4j load skipped/failed ({e}); local JSON graph traversal will be used instead.")
+    except Exception:
+        logger.warning("Neo4j load skipped/failed for %s; local JSON graph traversal will be used instead", repo_url, exc_info=True)
 
+    logger.info("Ingest complete: repo_url=%s slug=%s chunks=%d neo4j_loaded=%s", repo_url, slug, len(chunks), neo4j_loaded)
     return {
         "repo_url": repo_url,
         "slug": slug,

@@ -1,11 +1,13 @@
+.git
 venv/
-repo_src/
 __pycache__/
 *.pyc
-.pytest_cache/
+repo_src/
 data/store.db
 data/embedder.pkl
 data/jobs.db
 data/qdrant/
 .env
 .DS_Store
+tests/
+.github/
