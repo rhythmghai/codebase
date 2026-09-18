@@ -11,6 +11,12 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from ingestion.chunker import ingest_repo
 from ingestion.embedder import get_embedder
 from storage.db import build_store
+from storage.vector_store import QdrantVectorStore
+
+# Must match api/main.py's _load_default_pipeline()'s repo_id -- this is
+# the Qdrant collection name the default dataset gets indexed under.
+DEFAULT_REPO_ID = "fastapi_test"
+
 
 def main():
     project_root = Path(__file__).parent.parent
@@ -35,8 +41,12 @@ def main():
 
     print("\n== Step 3: Storage ==")
     chunk_dicts = [c.__dict__ for c in chunks]
-    build_store(db_path, chunk_dicts, vectors)
-    print(f"Stored to {db_path}")
+    build_store(db_path, chunk_dicts)
+    print(f"Stored chunk metadata to {db_path}")
+
+    print("\n== Step 4: Vector index ==")
+    QdrantVectorStore().rebuild(DEFAULT_REPO_ID, [c.chunk_id for c in chunks], vectors)
+    print(f"Indexed {len(chunks)} vectors into Qdrant collection '{DEFAULT_REPO_ID}'")
 
     # persist the embedder's fitted vectorizer so query-time encode() is consistent
     import pickle

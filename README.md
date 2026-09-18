@@ -12,9 +12,10 @@ actually testing that claim and fixing what testing found broken.
 
 ## What's actually in here
 
-- **Hybrid retrieval** — dense vector search (sentence-transformers) + BM25
-  full-text + graph neighbor expansion (calls / class-containment,
-  extracted deterministically from the AST, not LLM-inferred)
+- **Hybrid retrieval** — dense vector search (sentence-transformers embeddings,
+  Qdrant HNSW-indexed ANN search — not a brute-force scan) + BM25 full-text +
+  graph neighbor expansion (calls / class-containment, extracted
+  deterministically from the AST, not LLM-inferred)
 - **Real graph database, not a JSON adjacency list** — Neo4j AuraDB, queried
   via Cypher at retrieval time. Ingestion resolves callee references once
   and pushes nodes/edges in; falls back gracefully to a local JSON graph if
@@ -36,14 +37,15 @@ actually testing that claim and fixing what testing found broken.
 ```
   ingestion (POST /ingest, async job + polling)
     git clone -> auto-detect source dir -> AST chunker -> {chunks, call/contains graph}
-                                              |                        |
-                                        embed (sentence-transformers)  push to Neo4j (Cypher)
+                                              |                |                |
+                                        embed (sentence-   index into      push to Neo4j
+                                        transformers)       Qdrant         (Cypher)
                                               |
-                                        store (SQLite / Postgres+pgvector in prod)
+                                        chunk metadata + BM25 (SQLite)
 
   query time (POST /query, LangGraph, fixed edges)
-    rewrite -> hybrid_retrieve (vector + BM25 + Neo4j graph traversal) -> rerank
-             -> assemble_context -> generate -> self_check -> answer
+    rewrite -> hybrid_retrieve (Qdrant vector search + BM25 + Neo4j graph traversal) -> rerank
+             -> assemble_context -> generate -> self_check -> (reflect once if ungrounded) -> answer
 ```
 
 A pastel-themed web UI (`ui/index.html`) sits on top: paste a repo URL,
@@ -82,6 +84,14 @@ by ~8 points. The reranker-choice finding replicated independently across
 both eval sets and is treated as solid; graph's specific numeric contribution
 within the multi-hop set is not treated as stable at this sample size and
 would need a larger set (25-30+) before drawing firm conclusions there.
+
+**Note on the table above:** these numbers were measured before the
+vector-search backend moved from a brute-force numpy scan to Qdrant
+(see "Production hardening"). Both compute exact cosine similarity at
+this corpus size (HNSW is near-exact, not lossy, at a few hundred vectors),
+so the ranking math is unchanged — but the table hasn't been re-run against
+the Qdrant-backed path, so treat these as representative, not re-verified
+post-migration.
 
 ## The bug-fix history behind these numbers
 
@@ -127,31 +137,116 @@ its own discipline, not a one-time setup step.
 
 ## API
 
+All endpoints except `GET /health` require an `X-API-Key` header once
+`API_KEYS` is set (see Setup below) — unauthenticated, rate-limit-only
+access is for local dev only.
+
 - `POST /ingest` — `{"repo_url": "..."}`. Returns `{job_id, status}`
   immediately; actual clone+embed+graph-load runs as a background task.
+  Rejects a second concurrent ingest for the same repo (`409`) instead of
+  racing two clones against the same workspace directory.
 - `GET /ingest/status/{job_id}` — poll for `running` / `done` / `error`.
-- `POST /query` — `{"question": "..."}`. Returns the answer, a groundedness
-  flag, and retrieved sources with file/line citations and which channel
-  (vector/bm25/graph) surfaced each one.
-- `GET /health` — status + currently active repo.
+  Job status is persisted to SQLite (`data/jobs.db`), not held in memory,
+  so it survives a process restart as long as `DATA_DIR` is on persistent
+  storage. A `running` job older than 30 minutes is flagged `stale: true`
+  — a background task lost to a restart has no way to update its own
+  status, so this is a signal to re-ingest rather than keep polling.
+- `POST /query` — `{"question": "...", "repo_id": "<optional>"}`. Omit
+  `repo_id` to query the most recently ingested repo. Returns the answer, a
+  groundedness flag, and retrieved sources with file/line citations and
+  which channel (vector/bm25/graph) surfaced each one.
+- `GET /repos` — lists every repo currently loaded (bounded by
+  `MAX_ACTIVE_REPOS`, LRU-evicted) and which one is the default for
+  `/query` calls that omit `repo_id`.
+- `GET /health` — status, whether any repo is ready to query, and how many
+  are currently loaded. No auth required (standard for infra health checks).
+
+Every response carries an `X-Request-ID` header; server-side logs for that
+request are tagged with the same ID, so a client-reported error can be
+traced back through retrieval/pipeline/storage without guessing.
 
 ## Known simplifications (stated, not hidden)
 
-- One global pipeline instance backs the API — indexing a new repo replaces
-  the previously active one. A production version would key storage by
-  `repo_id` to serve multiple repos/users concurrently.
+- Ingestion is full delete-then-reinsert, not incremental upsert — correct
+  but wasteful for a repo that's barely changed since last index.
 - Neo4j's AuraDB free tier is a single shared instance — every node/edge is
   scoped by `repo_id` to prevent cross-repo contamination, but there's no
   per-tenant isolation beyond that property filter.
-- Ingestion is full delete-then-reinsert, not incremental upsert — correct
-  but wasteful for a repo that's barely changed since last index.
+- `DATA_DIR` and `WORKSPACE_ROOT` default to paths inside the app's own
+  filesystem. On most container platforms (Railway included) that's
+  ephemeral across redeploys — mount a persistent volume at those paths (or
+  point them at one) if ingested repos, the Qdrant vector index, and job
+  history need to survive a restart.
+- Chunk metadata + BM25 still live in SQLite, mirroring a future
+  Postgres+FTS schema — that migration (for the metadata store only, not
+  vectors, which are already Qdrant) hasn't happened in this codebase yet.
+- Auth is a single shared-secret allowlist (`API_KEYS`), not per-user
+  accounts/OAuth/key rotation — sufficient to stop the service being an
+  open proxy for compute and LLM spend, not a full identity system.
+
+## Production hardening (added after the initial build)
+
+A structured review of this codebase for production-readiness (not just
+correctness) turned up a specific list of gaps, all since addressed:
+
+- **A real vector database** — vector search used to be a brute-force numpy
+  scan over every embedding stored as a raw BLOB in SQLite (O(n) per query,
+  the whole corpus resident in memory, no index at all). Now backed by
+  Qdrant (HNSW-indexed ANN search), embedded/local by default (zero extra
+  setup — same operational shape as SQLite) with a one-env-var upgrade path
+  (`QDRANT_URL`) to a hosted/self-hosted instance, mirroring exactly how
+  Neo4j's optional-upgrade shape already worked.
+- **Auth + per-client rate limiting** — `X-API-Key` required once `API_KEYS`
+  is set; the token-bucket rate limiter is keyed per caller identity, not
+  shared process-wide (previously, one caller exhausting the shared budget
+  throttled every other caller too).
+- **Multi-repo state** — ingesting a new repo used to silently redirect
+  every other in-flight/future query to a different codebase. Pipelines are
+  now cached per `repo_id` (LRU-bounded via `MAX_ACTIVE_REPOS`), addressable
+  via `/query`'s optional `repo_id` field.
+- **Persisted job state** — `GET /ingest/status/{job_id}` used to be backed
+  by an in-memory dict, lost on every restart. Now backed by SQLite.
+- **LLM failure handling** — `rewrite_query`/`generate_answer` calls are
+  now wrapped with a timeout + retry (`tenacity`) and fall back to the
+  deterministic `RuleBasedLLM` if the real backend keeps failing, instead
+  of the whole request hard-failing on a transient upstream error.
+  Malformed JSON from the rewrite call degrades gracefully instead of
+  raising an uncaught `JSONDecodeError`.
+- **A real (bounded) reflection loop** — previously, `self_check` computed
+  a groundedness flag but took no action on a negative result beyond a
+  warning string. The LangGraph pipeline now conditionally routes back
+  through one stricter regeneration attempt when the first answer looks
+  ungrounded, before giving up and returning the warning.
+- **No more leaking internals in errors** — `/query`'s exception handler
+  used to return `str(e)` straight to the client. It now logs the full
+  exception server-side (tagged with the request ID) and returns a fixed,
+  generic message.
+- **Transactional graph writes** — `Neo4jGraphStore.load_graph`'s
+  clear/create-nodes/create-edges steps used to be four separate implicit
+  transactions; a crash between any two left the graph partially loaded
+  with no way to detect it. Now one explicit transaction, all-or-nothing.
+- **Structured logging throughout** — every request gets a request ID
+  (returned as `X-Request-ID`, and attached to every log line emitted while
+  handling it); Neo4j/graph-fallback failures are logged instead of
+  silently swallowed.
+- **A real test suite + CI** — `tests/` (pytest, offline/no network —
+  `TfidfEmbedder` + `LexicalReranker` + `RuleBasedLLM` stand in for the
+  neural/network-dependent backends) covers retrieval RRF math, the graph-
+  neighbor-resolution bug class from the fix history below, the chunk-ID
+  collision bug class, the LLM-fallback and reflection-loop logic, and the
+  API layer's auth/rate-limit/validation/error paths. Runs on every push
+  via GitHub Actions (`.github/workflows/ci.yml`).
 
 ## Stack
 
-FastAPI · LangGraph · Neo4j AuraDB (Cypher graph traversal) · SQLite (local)
-/ Postgres+pgvector (Supabase, prod target) · sentence-transformers (MiniLM
-embeddings) · Gemini 2.5 flash-lite via `google-genai` (query rewrite +
-generation) · vanilla HTML/CSS/JS (UI, no build step)
+FastAPI · LangGraph · Qdrant (HNSW-indexed vector search, embedded/local by
+default, upgrades to hosted/self-hosted via `QDRANT_URL`) · Neo4j AuraDB
+(Cypher graph traversal) · SQLite (chunk metadata + BM25 full-text, local
+/ Postgres+FTS in prod — not yet migrated, see Known simplifications) ·
+sentence-transformers (MiniLM embeddings) · Gemini 2.5 flash-lite via
+`google-genai` (query rewrite + generation) · `tenacity` (LLM
+retry/backoff) · pytest + GitHub Actions (tests/CI) · vanilla HTML/CSS/JS
+(UI, no build step)
 
 ## Setup
 
@@ -159,12 +254,28 @@ generation) · vanilla HTML/CSS/JS (UI, no build step)
 git clone https://github.com/rhythmghai/codebase.git
 cd codebase
 python3 -m venv venv && source venv/bin/activate
-pip install -r requirements.txt
+pip install -r requirements-dev.txt   # requirements.txt alone omits pytest/httpx
+cp .env.example .env                  # fill in API_KEYS at minimum before any public deployment
 git clone https://github.com/fastapi/fastapi.git repo_src   # or point /ingest at any repo instead
 python3 ingestion/run_ingestion.py   # regenerates data/embedder.pkl and data/store.db -- not tracked in git, deterministically regeneratable from source
 uvicorn api.main:app --reload --port 8000
 ```
 
+Or via Docker: `docker build -t coderag . && docker run -p 8000:8000 --env-file .env coderag`
+(mount a volume at `DATA_DIR`/`WORKSPACE_ROOT` for data to survive a restart).
+
+Run the test suite: `pytest` (offline, no network or GPU required — see
+"Production hardening" above for what it covers).
+
+Qdrant (required, zero setup by default): vector search always runs
+through Qdrant, but its embedded mode needs no account or server —
+`data/qdrant` is created automatically on first ingest. Set `QDRANT_URL`
+(+ `QDRANT_API_KEY`) instead to point at a real hosted/self-hosted
+instance, with no code changes.
+
 Neo4j (optional but recommended): set `NEO4J_URI`, `NEO4J_USERNAME`,
 `NEO4J_PASSWORD` in `.env` (free AuraDB instance). Without it, graph
 expansion falls back to the local JSON file automatically.
+
+See `.env.example` for the full list of environment variables (auth, CORS,
+rate limits, data/workspace paths, LLM timeout) and what each defaults to.

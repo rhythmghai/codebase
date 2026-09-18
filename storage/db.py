@@ -1,18 +1,19 @@
 """
-Local dev storage: SQLite + FTS5, mirroring the Postgres+pgvector schema
-in schema_postgres.sql. Vectors are stored as raw bytes (numpy float32) and
-compared in Python since SQLite has no native vector index — fine at this
-repo's scale (~450 chunks); Postgres+ivfflat is the real answer at scale.
+Local dev storage: SQLite + FTS5 for chunk metadata and lexical (BM25)
+search. Embeddings no longer live here -- they're stored and searched via
+a real vector index (storage/vector_store.py, Qdrant) instead of the raw
+BLOB + brute-force numpy scan this file used to do. This file now owns
+exactly two things: chunk metadata (for citations/context assembly) and
+full-text search.
 
-Retrieval code (retrieval/hybrid_search.py) only depends on the three
-functions below, so swapping this file for a real Postgres client later
-doesn't touch anything upstream.
+Retrieval code (retrieval/hybrid_search.py) only depends on the functions
+below, so swapping this file for a real Postgres client later doesn't
+touch anything upstream.
 """
 
 import sqlite3
+import threading
 import json
-import numpy as np
-from pathlib import Path
 
 
 SCHEMA = """
@@ -27,8 +28,7 @@ CREATE TABLE IF NOT EXISTS chunks (
     source         TEXT,
     docstring      TEXT,
     signature      TEXT,
-    parent_class   TEXT,
-    embedding      BLOB
+    parent_class   TEXT
 );
 
 CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
@@ -38,7 +38,19 @@ CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
     signature,
     source
 );
+
+-- qualified_name is the lookup key for get_all_qname_to_id/get_ids_by_qnames,
+-- which graph expansion calls on every query -- without this index those are
+-- full table scans. Free at this repo's scale (~450 rows), real at real scale.
+CREATE INDEX IF NOT EXISTS idx_chunks_qualified_name ON chunks(qualified_name);
 """
+
+# get_conn() used to run `executescript(SCHEMA)` (a DDL statement, which
+# implicitly commits and takes a brief write lock) on every single call --
+# i.e. on every retrieval helper, every query. Tracking which db_path has
+# already been initialized in this process turns that into a one-time cost.
+_initialized_dbs: set[str] = set()
+_init_lock = threading.Lock()
 
 # Natural-language queries carry stopwords ("how", "does", "the") that will
 # never appear in code identifiers/docstrings, and FTS5's default MATCH
@@ -53,9 +65,20 @@ _STOPWORDS = {
 
 
 def get_conn(db_path: str) -> sqlite3.Connection:
-    conn = sqlite3.connect(db_path)
+    # timeout=30: SQLite's busy-timeout, so a writer holding the DB briefly
+    # (e.g. build_store's delete-then-reinsert during ingestion) makes
+    # concurrent readers wait up to 30s instead of raising
+    # "database is locked" immediately.
+    conn = sqlite3.connect(db_path, timeout=30)
     conn.row_factory = sqlite3.Row
-    conn.executescript(SCHEMA)
+    with _init_lock:
+        if db_path not in _initialized_dbs:
+            conn.executescript(SCHEMA)
+            # WAL lets readers proceed concurrently with a writer instead of
+            # blocking on the single rollback-journal lock every write used
+            # to take under the default journal mode.
+            conn.execute("PRAGMA journal_mode=WAL")
+            _initialized_dbs.add(db_path)
     return conn
 
 
@@ -64,23 +87,25 @@ def load_chunks(chunks_jsonl: str) -> list[dict]:
         return [json.loads(line) for line in f]
 
 
-def build_store(db_path: str, chunks: list[dict], embeddings: np.ndarray):
+def build_store(db_path: str, chunks: list[dict]):
+    """Chunk metadata + FTS index only. Vector storage is a separate call
+    to storage/vector_store.py's QdrantVectorStore.rebuild() -- ingestion
+    callers do both, not just this one."""
     conn = get_conn(db_path)
     cur = conn.cursor()
     cur.execute("DELETE FROM chunks")
     cur.execute("DELETE FROM chunks_fts")
 
-    for c, vec in zip(chunks, embeddings):
+    for c in chunks:
         cur.execute(
             """INSERT INTO chunks
                (chunk_id, kind, name, qualified_name, file_path, start_line,
-                end_line, source, docstring, signature, parent_class, embedding)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                end_line, source, docstring, signature, parent_class)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 c["chunk_id"], c["kind"], c["name"], c["qualified_name"],
                 c["file_path"], c["start_line"], c["end_line"], c["source"],
                 c["docstring"], c["signature"], c["parent_class"],
-                vec.astype(np.float32).tobytes(),
             ),
         )
         cur.execute(
@@ -91,16 +116,6 @@ def build_store(db_path: str, chunks: list[dict], embeddings: np.ndarray):
 
     conn.commit()
     conn.close()
-
-
-def load_all_embeddings(db_path: str) -> tuple[list[str], np.ndarray]:
-    """Load all (chunk_id, embedding) pairs into memory for cosine search."""
-    conn = get_conn(db_path)
-    rows = conn.execute("SELECT chunk_id, embedding FROM chunks").fetchall()
-    conn.close()
-    ids = [r["chunk_id"] for r in rows]
-    vecs = np.stack([np.frombuffer(r["embedding"], dtype=np.float32) for r in rows])
-    return ids, vecs
 
 
 def get_chunks_by_ids(db_path: str, chunk_ids: list[str]) -> dict[str, dict]:

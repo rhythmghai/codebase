@@ -25,9 +25,22 @@ once per ingestion, not once per retrieval call.
 """
 
 import os
+import threading
+import logging
 from neo4j import GraphDatabase
 from dotenv import load_dotenv
 load_dotenv()
+
+logger = logging.getLogger(__name__)
+
+# _ensure_constraints() issues a schema-mutating CREATE CONSTRAINT call.
+# It's idempotent (IF NOT EXISTS) but CodebaseRAGPipeline builds a fresh
+# Neo4jGraphStore on every pipeline construction (i.e. potentially on every
+# repo swap / cache miss on the query path, not just at ingestion) -- so
+# without this guard it pays an avoidable round-trip on every one of those
+# instead of once per process.
+_constraints_ensured = False
+_constraints_lock = threading.Lock()
 
 
 class Neo4jGraphStore:
@@ -45,15 +58,20 @@ class Neo4jGraphStore:
         self.driver.close()
 
     def _ensure_constraints(self):
-        # Uniqueness per (repo_id, qualified_name) -- lets MERGE act as a
-        # real upsert instead of creating duplicate nodes on re-ingestion.
-        with self.driver.session() as session:
-            session.run(
-                """
-                CREATE CONSTRAINT entity_repo_qname IF NOT EXISTS
-                FOR (n:Entity) REQUIRE (n.repo_id, n.qualified_name) IS UNIQUE
-                """
-            )
+        global _constraints_ensured
+        with _constraints_lock:
+            if _constraints_ensured:
+                return
+            # Uniqueness per (repo_id, qualified_name) -- lets MERGE act as a
+            # real upsert instead of creating duplicate nodes on re-ingestion.
+            with self.driver.session() as session:
+                session.run(
+                    """
+                    CREATE CONSTRAINT entity_repo_qname IF NOT EXISTS
+                    FOR (n:Entity) REQUIRE (n.repo_id, n.qualified_name) IS UNIQUE
+                    """
+                )
+            _constraints_ensured = True
 
     def clear_repo(self, repo_id: str):
         """Delete all nodes/edges for a repo before re-ingesting it (mirrors
@@ -70,9 +88,15 @@ class Neo4jGraphStore:
                 qualified_names actually exist as real entities.
         graph_data: the GraphData dict produced by the chunker
                     ({"nodes", "calls", "imports", "contains"}).
-        """
-        self.clear_repo(repo_id)
 
+        The clear + node-create + CALLS-create + CONTAINS-create steps used
+        to be four separate implicit transactions -- a crash or timeout
+        between any two of them left the graph partially loaded (e.g. nodes
+        with no edges) with no way to detect it short of re-ingesting.
+        Running the whole thing through session.execute_write makes it one
+        transaction: either the repo's graph ends up fully replaced, or (on
+        any failure) it's left exactly as it was before this call.
+        """
         known_qnames = {c["qualified_name"] for c in chunks}
         qname_to_module = {
             c["qualified_name"]: c["qualified_name"].rsplit(".", 1)[0]
@@ -94,9 +118,10 @@ class Neo4jGraphStore:
             if cls_q in known_qnames and method_q in known_qnames
         ]
 
-        with self.driver.session() as session:
-            # Batch-create nodes
-            session.run(
+        def _tx(tx):
+            tx.run("MATCH (n:Entity {repo_id: $repo_id}) DETACH DELETE n", repo_id=repo_id)
+
+            tx.run(
                 """
                 UNWIND $nodes AS node
                 MERGE (n:Entity {repo_id: $repo_id, qualified_name: node.qualified_name})
@@ -114,8 +139,7 @@ class Neo4jGraphStore:
                 ],
             )
 
-            # Batch-create CALLS edges
-            session.run(
+            tx.run(
                 """
                 UNWIND $edges AS edge
                 MATCH (a:Entity {repo_id: $repo_id, qualified_name: edge.src})
@@ -126,8 +150,7 @@ class Neo4jGraphStore:
                 edges=[{"src": s, "dst": d} for s, d in resolved_calls],
             )
 
-            # Batch-create CONTAINS edges
-            session.run(
+            tx.run(
                 """
                 UNWIND $edges AS edge
                 MATCH (a:Entity {repo_id: $repo_id, qualified_name: edge.src})
@@ -138,6 +161,13 @@ class Neo4jGraphStore:
                 edges=[{"src": s, "dst": d} for s, d in contains_edges],
             )
 
+        with self.driver.session() as session:
+            session.execute_write(_tx)
+
+        logger.info(
+            "Loaded graph for repo_id=%s: %d nodes, %d calls edges, %d contains edges",
+            repo_id, len(chunks), len(resolved_calls), len(contains_edges),
+        )
         return {"nodes": len(chunks), "calls": len(resolved_calls), "contains": len(contains_edges)}
 
     def get_neighbors(self, repo_id: str, qualified_names: list[str], max_neighbors_per_seed: int = 3) -> list[str]:
@@ -166,8 +196,18 @@ class Neo4jGraphStore:
 
 def get_neo4j_store() -> Neo4jGraphStore | None:
     """Returns None (rather than raising) if Neo4j isn't configured, so
-    callers can gracefully fall back to the local JSON-based graph."""
+    callers can gracefully fall back to the local JSON-based graph.
+
+    The exception is logged (not swallowed silently) so a persistently
+    broken Neo4j connection -- bad credentials, network partition -- is
+    distinguishable in logs from the intentional "not configured" case,
+    even though both degrade the same way functionally.
+    """
     try:
         return Neo4jGraphStore()
+    except ValueError:
+        logger.info("Neo4j not configured (NEO4J_URI/NEO4J_PASSWORD unset) -- using local JSON graph fallback")
+        return None
     except Exception:
+        logger.warning("Neo4j connection failed -- falling back to local JSON graph", exc_info=True)
         return None
