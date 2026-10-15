@@ -24,6 +24,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from retrieval.hybrid_search import vector_search, bm25_search_wrapper, merge_candidates, graph_expand
 from retrieval.reranker import get_reranker
 from storage.db import get_chunks_by_ids
+from storage.vector_store import QdrantVectorStore
 
 
 _PROJECT_ROOT = Path(__file__).parent.parent
@@ -32,6 +33,9 @@ GRAPH_PATH = str(_PROJECT_ROOT / "data" / "graph.json")
 EMBEDDER_PATH = str(_PROJECT_ROOT / "data" / "embedder.pkl")
 LABELED_PATH = str(_PROJECT_ROOT / "eval" / "labeled_queries.json")
 LABELED_MULTIHOP_PATH = str(_PROJECT_ROOT / "eval" / "labeled_queries_multihop.json")
+# Must match ingestion/run_ingestion.py's DEFAULT_REPO_ID -- this harness
+# always evaluates against the default locally-ingested dataset.
+REPO_ID = "fastapi_test"
 
 
 def recall_at_k(ranked_ids: list[str], relevant: set[str], k: int) -> float:
@@ -59,11 +63,11 @@ def qnames_to_ids(qnames: list[str], all_chunks: list[dict]) -> set[str]:
     return {lookup[q] for q in qnames if q in lookup}
 
 
-def run_config(query: str, query_vec, use_bm25: bool, use_graph: bool, use_rerank: bool,
+def run_config(query: str, query_vec, vector_store, use_bm25: bool, use_graph: bool, use_rerank: bool,
                 reranker, k: int = 8) -> list[str]:
     candidates = []
     if True:  # vector always on -- baseline retrieval channel
-        candidates += vector_search(query_vec, DB_PATH, top_k=15)
+        candidates += vector_search(vector_store, REPO_ID, query_vec, top_k=15)
     if use_bm25:
         candidates += bm25_search_wrapper(query, DB_PATH, top_k=15)
 
@@ -84,7 +88,7 @@ def run_config(query: str, query_vec, use_bm25: bool, use_graph: bool, use_reran
         return [r.chunk_id for r in ordered[:k]]
 
 
-def evaluate_config(labeled: list[dict], all_chunks: list[dict], embedder, reranker,
+def evaluate_config(labeled: list[dict], all_chunks: list[dict], embedder, reranker, vector_store,
                      use_bm25: bool, use_graph: bool, use_rerank: bool, k: int = 8) -> dict:
     recalls, precisions, mrrs = [], [], []
     for item in labeled:
@@ -93,7 +97,7 @@ def evaluate_config(labeled: list[dict], all_chunks: list[dict], embedder, reran
         if not relevant_ids:
             continue
         query_vec = embedder.encode([query])[0]
-        ranked_ids = run_config(query, query_vec, use_bm25, use_graph, use_rerank, reranker, k=k)
+        ranked_ids = run_config(query, query_vec, vector_store, use_bm25, use_graph, use_rerank, reranker, k=k)
 
         recalls.append(recall_at_k(ranked_ids, relevant_ids, k))
         precisions.append(precision_at_k(ranked_ids, relevant_ids, k))
@@ -108,7 +112,7 @@ def evaluate_config(labeled: list[dict], all_chunks: list[dict], embedder, reran
     }
 
 
-def run_eval_set(name: str, labeled_path: str, all_chunks: list, embedder, reranker) -> dict:
+def run_eval_set(name: str, labeled_path: str, all_chunks: list, embedder, reranker, vector_store) -> dict:
     labeled = json.load(open(labeled_path))
     configs = [
         ("vector-only",                 dict(use_bm25=False, use_graph=False, use_rerank=False)),
@@ -122,7 +126,7 @@ def run_eval_set(name: str, labeled_path: str, all_chunks: list, embedder, reran
     print("-" * 65)
     results = {}
     for config_name, kwargs in configs:
-        metrics = evaluate_config(labeled, all_chunks, embedder, reranker, **kwargs)
+        metrics = evaluate_config(labeled, all_chunks, embedder, reranker, vector_store, **kwargs)
         results[config_name] = metrics
         print(f"{config_name:<28} {metrics['recall@8']:>10.3f} {metrics['precision@8']:>13.3f} {metrics['mrr']:>8.3f}")
     return results
@@ -131,6 +135,7 @@ def run_eval_set(name: str, labeled_path: str, all_chunks: list, embedder, reran
 def main():
     all_chunks = [json.loads(l) for l in open(_PROJECT_ROOT / "data" / "chunks.jsonl")]
     embedder = pickle.load(open(EMBEDDER_PATH, "rb"))
+    vector_store = QdrantVectorStore()
     try:
         reranker = get_reranker("cross-encoder")
         reranker_name = "cross-encoder (neural)"
@@ -142,10 +147,10 @@ def main():
 
     all_results = {}
     all_results["single_hop"] = run_eval_set(
-        "Single-hop (original set)", LABELED_PATH, all_chunks, embedder, reranker
+        "Single-hop (original set)", LABELED_PATH, all_chunks, embedder, reranker, vector_store
     )
     all_results["multi_hop"] = run_eval_set(
-        "Multi-hop / structural (graph-focused set)", LABELED_MULTIHOP_PATH, all_chunks, embedder, reranker
+        "Multi-hop / structural (graph-focused set)", LABELED_MULTIHOP_PATH, all_chunks, embedder, reranker, vector_store
     )
 
     with open(_PROJECT_ROOT / "eval" / "results.json", "w") as f:

@@ -235,6 +235,29 @@
     font-family: 'JetBrains Mono', monospace;
   }
   .status-line.error { color: #B8386E; }
+
+  .api-key-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    justify-content: center;
+    margin-bottom: 18px;
+  }
+  .api-key-row label {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    color: var(--ink-soft);
+  }
+  #apiKey {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 12px;
+    padding: 6px 10px;
+    border-radius: 8px;
+    border: 1px solid var(--surface-border);
+    background: rgba(255,255,255,0.5);
+    color: var(--ink);
+    width: 220px;
+  }
 </style>
 </head>
 <body>
@@ -244,6 +267,11 @@
       <div class="eyebrow">hybrid · graph · reranked</div>
       <h1>CodeRAG</h1>
       <p class="subtitle">Ask a natural-language question about the FastAPI source</p>
+    </div>
+
+    <div class="api-key-row">
+      <label for="apiKey">API key (only needed if the server has auth enabled)</label>
+      <input id="apiKey" type="password" placeholder="X-API-Key" autocomplete="off" />
     </div>
 
     <div class="ask-card" id="ingestCard" style="margin-bottom: 14px;">
@@ -274,8 +302,37 @@
   </div>
 
 <script>
-  const API_URL = "http://127.0.0.1:8000/query";
-  const INGEST_URL = "http://127.0.0.1:8000/ingest";
+  // Same file serves both local dev (points at a locally-running
+  // uvicorn) and the deployed static build on Vercel (points at the
+  // Render-hosted API) -- picks the right base automatically instead of
+  // needing two versions of this file. An explicit ?api=<url> query param
+  // (persisted to localStorage) overrides either default, e.g. if the
+  // Render URL ends up with a different suffix than expected.
+  const LOCAL_HOSTNAMES = ["localhost", "127.0.0.1"];
+  const DEPLOYED_API_BASE = "https://coderag-api.onrender.com"; // update if Render assigns a different URL
+
+  const urlOverride = new URLSearchParams(location.search).get("api");
+  if (urlOverride) localStorage.setItem("coderag_api_base", urlOverride);
+  const API_BASE = localStorage.getItem("coderag_api_base")
+    || (LOCAL_HOSTNAMES.includes(location.hostname) ? "http://127.0.0.1:8000" : DEPLOYED_API_BASE);
+
+  const API_URL = API_BASE + "/query";
+  const INGEST_URL = API_BASE + "/ingest";
+
+  // Only needed once the server has API_KEYS configured -- unset (the
+  // default for local dev), the server ignores this header entirely.
+  // Persisted to localStorage as a per-browser convenience only; never
+  // sent anywhere but this API.
+  const apiKeyInput = document.getElementById('apiKey');
+  apiKeyInput.value = localStorage.getItem('coderag_api_key') || '';
+  apiKeyInput.addEventListener('input', () => {
+    localStorage.setItem('coderag_api_key', apiKeyInput.value);
+  });
+
+  function authHeaders() {
+    const key = apiKeyInput.value.trim();
+    return key ? { "X-API-Key": key } : {};
+  }
 
   async function ingest() {
     const repoUrl = document.getElementById('repoUrl').value.trim();
@@ -296,7 +353,7 @@
       // the actual clone+embed work happens in a background task.
       const startRes = await fetch(INGEST_URL, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", ...authHeaders() },
         body: JSON.stringify({ repo_url: repoUrl })
       });
       const startData = await startRes.json();
@@ -310,7 +367,7 @@
       let result = null;
       while (true) {
         await new Promise(r => setTimeout(r, 2000));
-        const statusRes = await fetch(statusUrl);
+        const statusRes = await fetch(statusUrl, { headers: authHeaders() });
         const statusData = await statusRes.json();
         if (!statusRes.ok) throw new Error(statusData.detail || "Status check failed");
 
@@ -360,7 +417,7 @@
     try {
       const res = await fetch(API_URL, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", ...authHeaders() },
         body: JSON.stringify({ question })
       });
 

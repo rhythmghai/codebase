@@ -1,0 +1,13 @@
+.git
+venv/
+__pycache__/
+*.pyc
+repo_src/
+data/store.db
+data/embedder.pkl
+data/jobs.db
+data/qdrant/
+.env
+.DS_Store
+tests/
+.github/

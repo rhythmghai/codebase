@@ -1,7 +1,8 @@
 """
-Hybrid retrieval: dense vector search + BM25 full-text + graph neighbor
-expansion, run in parallel conceptually (sequential here for simplicity,
-each is independent of the others) and merged before reranking.
+Hybrid retrieval: dense vector search (Qdrant, HNSW-indexed) + BM25
+full-text + graph neighbor expansion, run in parallel conceptually
+(sequential here for simplicity, each is independent of the others) and
+merged before reranking.
 
 This is the layer that answers "why hybrid instead of just vector search":
 - vector search catches semantic/paraphrased queries ("how do routes get registered")
@@ -13,13 +14,25 @@ This is the layer that answers "why hybrid instead of just vector search":
 
 import sys
 import json
+import logging
 import numpy as np
 from pathlib import Path
 from dataclasses import dataclass
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from storage.db import bm25_search, load_all_embeddings, get_chunks_by_ids, get_ids_by_qnames, get_all_qname_to_id
+from storage.db import bm25_search, get_chunks_by_ids, get_ids_by_qnames, get_all_qname_to_id
+
+logger = logging.getLogger(__name__)
+
+# merge_candidates' default RRF k. Graph-sourced candidates need a prior
+# score below the floor any vector/BM25 candidate can realistically get
+# from RRF, so structural neighbors never outrank a direct retrieval hit at
+# equal or better rank. With k=60 and candidate lists capped at top_k_each
+# (<=15 in this codebase), the worst realistic RRF score is 1/(60+15) ≈
+# 0.0133 -- GRAPH_PRIOR_SCORE is kept an order of magnitude below that.
+_RRF_K_DEFAULT = 60
+GRAPH_PRIOR_SCORE = 1e-3
 
 
 @dataclass
@@ -29,11 +42,9 @@ class RetrievedChunk:
     source: str  # "vector" | "bm25" | "graph"
 
 
-def vector_search(query_vec: np.ndarray, db_path: str, top_k: int = 15) -> list[RetrievedChunk]:
-    ids, vecs = load_all_embeddings(db_path)
-    sims = vecs @ query_vec  # vectors are pre-normalized -> dot product = cosine sim
-    top_idx = np.argsort(-sims)[:top_k]
-    return [RetrievedChunk(ids[i], float(sims[i]), "vector") for i in top_idx]
+def vector_search(vector_store, repo_id: str, query_vec: np.ndarray, top_k: int = 15) -> list[RetrievedChunk]:
+    hits = vector_store.search(repo_id, query_vec, top_k)
+    return [RetrievedChunk(chunk_id, score, "vector") for chunk_id, score in hits]
 
 
 def bm25_search_wrapper(query: str, db_path: str, top_k: int = 15) -> list[RetrievedChunk]:
@@ -93,7 +104,7 @@ def graph_expand_local(chunk_ids: list[str], graph_path: str, qname_lookup: dict
     for nq in list(neighbor_qnames)[: max_neighbors * len(chunk_ids)]:
         nid = qname_to_id.get(nq)
         if nid and nid not in chunk_ids:
-            results.append(RetrievedChunk(nid, 0.001, "graph"))  # low prior weight, scaled below the RRF floor
+            results.append(RetrievedChunk(nid, GRAPH_PRIOR_SCORE, "graph"))
     return results
 
 
@@ -116,7 +127,7 @@ def graph_expand_neo4j(chunk_ids: list[str], neo4j_store, repo_id: str, db_path:
     for nq in neighbor_qnames:
         nid = qname_to_id.get(nq)
         if nid and nid not in chunk_ids:
-            results.append(RetrievedChunk(nid, 0.001, "graph"))
+            results.append(RetrievedChunk(nid, GRAPH_PRIOR_SCORE, "graph"))
     return results
 
 
@@ -133,11 +144,15 @@ def graph_expand(chunk_ids: list[str], graph_path: str, qname_lookup: dict, db_p
         try:
             return graph_expand_neo4j(chunk_ids, neo4j_store, repo_id, db_path, qname_lookup, max_neighbors)
         except Exception:
-            pass  # fall through to local JSON on any Neo4j error (network, auth, etc.)
+            # Fall through to local JSON on any Neo4j error (network, auth,
+            # etc.) -- logged (not swallowed) so a persistently broken Neo4j
+            # connection is visible instead of silently degrading ranking
+            # quality on every query forever.
+            logger.warning("Neo4j graph_expand failed for repo_id=%s, falling back to local JSON graph", repo_id, exc_info=True)
     return graph_expand_local(chunk_ids, graph_path, qname_lookup, db_path, max_neighbors)
 
 
-def merge_candidates(*result_lists: list[RetrievedChunk], k: int = 60) -> dict[str, RetrievedChunk]:
+def merge_candidates(*result_lists: list[RetrievedChunk], k: int = _RRF_K_DEFAULT) -> dict[str, RetrievedChunk]:
     """
     Merge by chunk_id using Reciprocal Rank Fusion (RRF) instead of raw
     score comparison. Vector cosine scores and BM25 rank scores live on
@@ -162,9 +177,10 @@ def merge_candidates(*result_lists: list[RetrievedChunk], k: int = 60) -> dict[s
 
 
 def hybrid_retrieve(query: str, query_vec: np.ndarray, db_path: str, graph_path: str,
+                     vector_store, repo_id: str,
                      top_k_each: int = 15, use_graph: bool = True,
-                     neo4j_store=None, repo_id: str | None = None) -> list[RetrievedChunk]:
-    vec_results = vector_search(query_vec, db_path, top_k=top_k_each)
+                     neo4j_store=None) -> list[RetrievedChunk]:
+    vec_results = vector_search(vector_store, repo_id, query_vec, top_k=top_k_each)
     bm25_results = bm25_search_wrapper(query, db_path, top_k=top_k_each)
 
     merged = merge_candidates(vec_results, bm25_results)

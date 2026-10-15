@@ -1,10 +1,11 @@
-cat > .gitignore << 'EOF'
 venv/
 repo_src/
 __pycache__/
 *.pyc
+.pytest_cache/
 data/store.db
 data/embedder.pkl
+data/jobs.db
+data/qdrant/
 .env
 .DS_Store
-EOF

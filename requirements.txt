@@ -1,25 +1,23 @@
-fastapi
-uvicorn
-pydantic
-python-dotenv
+fastapi==0.141.1
+uvicorn==0.52.4
+pydantic==2.13.4
+python-dotenv==1.2.1
 
-langgraph
-langchain-core
+langgraph==1.2.11
+langchain-core==1.6.0
 
-networkx
-numpy
-scikit-learn
+numpy==2.2.6
+scikit-learn==1.7.2
 
-sentence-transformers
-transformers
-torch
+sentence-transformers==5.5.1
+transformers==5.8.1
+torch==2.10.0
 
-google-genai
+google-genai==2.23.0
 
-GitPython
+neo4j==5.28.6
+qdrant-client==1.19.0
 
-joblib
+joblib==1.5.2
 
-rank-bm25
-psycopg2-binary
-pgvector
+tenacity==9.1.2
