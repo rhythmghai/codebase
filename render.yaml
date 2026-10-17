@@ -15,10 +15,8 @@
 # the paid "starter" tier or above. See storage/vector_store.py and
 # storage/db.py's module docstrings for what's stored where.
 #
-# IMPORTANT: `branch` below targets the feature branch this Blueprint was
-# authored on (PR #1), not `main` -- main does not have this hardened
-# code yet. Update this to `main` (or remove the field, main is Render's
-# default) once that PR is merged.
+# PR #1 (the hardening + Qdrant work) merged into `main` on 2026-10-15;
+# `branch` below now correctly targets `main`.
 
 services:
   - type: web
@@ -28,7 +26,7 @@ services:
     dockerContext: .
     plan: free
     region: oregon
-    branch: hardening-and-vector-db
+    branch: main
     healthCheckPath: /health
     envVars:
       - key: DATA_DIR
