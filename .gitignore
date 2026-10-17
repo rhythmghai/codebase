@@ -9,3 +9,4 @@ data/jobs.db
 data/qdrant/
 .env
 .DS_Store
+.claude/
